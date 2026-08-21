@@ -1,5 +1,7 @@
 /**
  * Reliable epidemic mesh (paper §4).
+ * The paper does not name a socket. We implement the assumed reliable
+ * broadcast with: BroadcastChannel, WebRTC datachannels, and anti-entropy.
  */
 
 const STUN = [{ urls: "stun:stun.l.google.com:19302" }];

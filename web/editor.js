@@ -29,6 +29,7 @@ const SITE = siteId();
 const docEl = $("doc");
 
 let esbt;
+let applying = false;
 
 const mesh = new Mesh({
   room: ROOM,
@@ -113,6 +114,7 @@ docEl.addEventListener("beforeinput", (ev) => {
   ev.preventDefault();
   const { start, end } = saveSel();
   const span = Math.max(0, end - start);
+  applying = true;
   const out = [];
   if (span && (ev.inputType.startsWith("insert") || ev.inputType.startsWith("delete"))) {
     out.push(...esbt.deleteRange(SITE, start, span));
@@ -128,6 +130,7 @@ docEl.addEventListener("beforeinput", (ev) => {
     const data = ev.dataTransfer?.getData("text/plain") || ev.data || "";
     out.push(...esbt.insertUtf8(SITE, start, data));
   }
+  applying = false;
   for (const m of out) mesh.gossip(m);
   paint();
   persist();
