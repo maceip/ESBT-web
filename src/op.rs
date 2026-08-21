@@ -1,4 +1,4 @@
-//! INS(w, e, c) and DEL(w, c). Paper §4.2 / §5.2.
+//! INS(ω, e, c) and DEL(ω, c). Paper §4.2 / §5.2.
 
 use crate::fraction::Fraction;
 use crate::weight::{SiteId, Weight};
@@ -9,6 +9,8 @@ pub enum OpKind {
     Del,
 }
 
+/// Wire operation. `seq` is the origin's reliable-broadcast sequence
+/// (transport). `counter` is the paper's insertion counter c.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Op {
     pub kind: OpKind,
@@ -43,6 +45,7 @@ impl Op {
         matches!(self.kind, OpKind::Ins { .. })
     }
 
+    /// [tag][origin][seq][c][p][q][sn][wsite][sc_len][sc…][cp?]
     pub fn encode(&self) -> Vec<u8> {
         let mut b = Vec::new();
         b.push(match self.kind {

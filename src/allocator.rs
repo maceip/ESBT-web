@@ -5,7 +5,7 @@ use crate::newseq::newseq;
 use crate::weight::{SiteId, Weight};
 use std::collections::HashMap;
 
-/// Tracker: f ↦ (snL, snR). Only fractions that have hit Dmax are tracked.
+/// Tracker : f ↦ (snL, snR). Only fractions that have hit Dmax are tracked.
 #[derive(Clone, Debug, Default)]
 pub struct Tracker {
     map: HashMap<(i64, i64), (i64, i64)>,
@@ -45,33 +45,42 @@ impl Allocator {
     }
 
     /// Theorem 2: assign the mediant iff max(num, den) is within Dmax.
+    ///
+    /// Algorithm 2 line 10 is typeset with `or`, which would admit
+    /// unbounded denominators (e.g. 1/10^9) and contradict line 9
+    /// ("maximum num and den threshold"), Lemma 1's bound, Theorem 2,
+    /// and Situation 1 (3/7 rejected at Dmax=5). The formal statements win.
     pub fn mediant_fits(&self, f: Fraction) -> bool {
         !f.is_begin() && !f.is_end() && f.p < self.dmax && f.q < self.dmax
     }
 
     pub fn create_weight(&mut self, left: &Weight, right: &Weight, site: SiteId) -> Weight {
-        debug_assert!(left < right, "CREATE_WEIGHT requires w1 < w2");
+        debug_assert!(left < right, "CREATE_WEIGHT requires w1 prec w2");
         let fm = left.f.mediant(right.f);
 
         if self.mediant_fits(fm) {
             return Weight::new(fm, 0, vec![0], site);
         }
 
+        // Lines 13-16: fallback fraction. Sentinel 0/1 -> use the right.
         let fb = if left.f.is_begin() { right.f } else { left.f };
         let (sn_l, sn_r) = self.tracker.pair(fb);
 
+        // Right allocation (lines 19-23)
         if fb < right.f || (fb == right.f && sn_r < right.sn) {
             let sn = sn_r + 1;
             self.tracker.set(fb, sn_l, sn);
             return Weight::new(fb, sn, left.sc.clone(), site);
         }
 
+        // Left allocation (lines 24-28)
         if left.f < right.f && (sn_l - 1) < right.sn {
             let sn = sn_l - 1;
             self.tracker.set(fb, sn, sn_r);
             return Weight::new(fb, sn, left.sc.clone(), site);
         }
 
+        // Sequence path (lines 29-32)
         let sc = newseq(&left.sc, &right.sc, self.base, self.depth, site);
         Weight::new(fb, left.sn, sc, site)
     }
