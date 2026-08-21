@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /**
  * Static editor + WebSocket epidemic relay.
+ * The paper assumes reliable broadcast; this is that hop for distinct browsers.
  */
 import http from "node:http";
 import fs from "node:fs";

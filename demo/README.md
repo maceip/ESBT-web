@@ -18,6 +18,7 @@ system binary at `/opt/google/chrome/chrome`.
 ## Run
 
 ```bash
+# deps live in /tmp if the artifacts volume is picky
 PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 PUPPETEER_SKIP_DOWNLOAD=1 \
   npm install --prefix /tmp/esbt-npm
 

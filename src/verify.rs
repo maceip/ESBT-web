@@ -1,4 +1,4 @@
-//! Paper Situations 1–3, NEWSEQ examples, Alg. 3, SEC, join.
+//! Paper Situations 1-3, NEWSEQ examples, Alg. 3, SEC, join.
 
 use crate::allocator::Allocator;
 use crate::fraction::Fraction;
