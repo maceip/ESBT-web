@@ -1,4 +1,9 @@
 #!/usr/bin/env node
+/**
+ * Three-browser ESBT showcase.
+ * Playwright, Puppeteer, and agent-browser each drive a distinct Chrome
+ * against the same room. WebSocket signaling is the epidemic hop.
+ */
 import { spawn } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
 import { launchPlaywright } from "./harness-playwright.mjs";
