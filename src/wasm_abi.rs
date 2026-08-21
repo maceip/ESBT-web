@@ -219,6 +219,9 @@ pub unsafe extern "C" fn esbt_fill_gap(site: u32, ptr: *const u8, len: u32) -> i
         _ => return -3,
     };
     replica(site, |r| {
+        let missing = r.version.missing_after(&Default::default());
+        let gaps = their.missing_after(&r.version);
+        let _ = missing;
         let mut ops: Vec<Op> = Vec::new();
         for (&s, &n) in &r.version.next {
             let theirs = their.observed(s);
@@ -226,6 +229,7 @@ pub unsafe extern "C" fn esbt_fill_gap(site: u32, ptr: *const u8, len: u32) -> i
                 ops.extend(r.ops_in_range(s, theirs + 1, n));
             }
         }
+        let _ = gaps;
         let mut out = Vec::new();
         out.extend_from_slice(&(ops.len() as u32).to_le_bytes());
         for op in ops {
