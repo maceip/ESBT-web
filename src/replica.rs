@@ -37,6 +37,7 @@ pub struct Replica {
     pub counter_map: HashMap<WeightKey, u64>,
     pub counter: u64,
     pub version: Version,
+    /// Reliable log: (origin, seq) → op. Needed so a peer can retransmit.
     pub log: HashMap<(SiteId, u64), Op>,
     pub local_seq: u64,
 }
@@ -166,7 +167,8 @@ impl Replica {
                 if self.is_causally_ready(&self.pending[i]) {
                     let op = self.pending.remove(i).unwrap();
                     if matches!(op.kind, OpKind::Del) {
-                        self.delete_log.insert((op.weight.clone(), op.counter));
+                        self.delete_log
+                            .insert((op.weight.clone(), op.counter));
                     }
                     self.apply_ready(&op);
                     progressed = true;
@@ -183,6 +185,8 @@ impl Replica {
         }
     }
 
+    /// Algorithm 3, refined by Scenario 3: a deletion targets (ω, c),
+    /// not ω alone. After reuse, S may contain ω with a newer counter.
     pub fn is_causally_ready(&self, op: &Op) -> bool {
         match op.kind {
             OpKind::Ins { .. } => true,
@@ -216,8 +220,10 @@ impl Replica {
                 if self.doc.contains(&op.weight) {
                     return;
                 }
-                self.doc.insert(op.weight.clone(), ch, op.counter);
-                self.counter_map.insert(op.weight.clone(), op.counter);
+                self.doc
+                    .insert(op.weight.clone(), ch, op.counter);
+                self.counter_map
+                    .insert(op.weight.clone(), op.counter);
             }
             OpKind::Del => {
                 self.doc.delete(&op.weight);
@@ -251,8 +257,10 @@ impl Replica {
         self.delete_log.clear();
         self.pending.clear();
         for a in &snap.atoms {
-            self.doc.insert(a.weight.clone(), a.ch, a.counter);
-            self.counter_map.insert(a.weight.clone(), a.counter);
+            self.doc
+                .insert(a.weight.clone(), a.ch, a.counter);
+            self.counter_map
+                .insert(a.weight.clone(), a.counter);
         }
         for (w, c) in &snap.delete_log {
             self.delete_log.insert((w.clone(), *c));
