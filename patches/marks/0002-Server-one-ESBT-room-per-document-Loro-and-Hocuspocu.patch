@@ -1,0 +1,576 @@
+From e3f2bc4fec3ff2e1459b57188028144f80a7b276 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Fri, 21 Aug 2026 23:32:00 +0000
+Subject: [PATCH 2/5] Server: one ESBT room per document; Loro and
+ Hocuspocus/Yjs removed
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+EsbtRoom keeps the loro-room shape — full server replica, version-vector
+delta on join, debounced persist, idle eviction, discard-on-delete — with
+a stable per-document site id (marks-server:<id>) so a restart resumes the
+same replica instead of bloating every client's reconnect vector (§6).
+The upgrade path accepts only /collab/esbt/:id; the retired loro and yjs
+paths and rows created by those engines are refused so a stale client
+cannot corrupt stored state. Legacy rows stay listed but export empty.
+Seed and export go through EsbtDoc. loro-crdt, yjs and both Hocuspocus
+packages leave the dependency tree.
+---
+ server/src/api.ts                         |  41 +++------
+ server/src/{loro-room.ts => esbt-room.ts} |  63 ++++++-------
+ server/src/index.ts                       |  54 +++++------
+ server/src/seed.ts                        |  10 +-
+ server/src/store.ts                       |   8 +-
+ server/src/yjs-room.ts                    | 106 ----------------------
+ 6 files changed, 78 insertions(+), 204 deletions(-)
+ rename server/src/{loro-room.ts => esbt-room.ts} (81%)
+ delete mode 100644 server/src/yjs-room.ts
+
+diff --git a/server/src/api.ts b/server/src/api.ts
+index c2494e7..ecf8aaa 100644
+--- a/server/src/api.ts
++++ b/server/src/api.ts
+@@ -1,20 +1,16 @@
+ import { Router } from 'express';
+-import { LoroDoc } from 'loro-crdt';
+-import { LoroRoom, TEXT_CONTAINER } from './loro-room.js';
++import { EsbtDoc } from '@marks/esbt';
++import { EsbtRoom } from './esbt-room.js';
+ import {
+   createDocument,
+   deleteDocument,
+   getDocument,
+   getState,
+   listDocuments,
+-  type Engine,
+ } from './store.js';
+-import { discardYjsDocument, yjsLiveText, yjsTextFromState } from './yjs-room.js';
+ 
+ export const api = Router();
+ 
+-const isEngine = (value: unknown): value is Engine => value === 'loro' || value === 'yjs';
+-
+ api.get('/health', (_req, res) => {
+   res.json({ ok: true, uptime: process.uptime() });
+ });
+@@ -24,9 +20,8 @@ api.get('/documents', (_req, res) => {
+ });
+ 
+ api.post('/documents', (req, res) => {
+-  const engine = isEngine(req.body?.engine) ? req.body.engine : 'loro';
+   const title = typeof req.body?.title === 'string' ? req.body.title : undefined;
+-  res.status(201).json({ document: createDocument({ engine, title }) });
++  res.status(201).json({ document: createDocument({ engine: 'esbt', title }) });
+ });
+ 
+ api.get('/documents/:id', (req, res) => {
+@@ -35,7 +30,7 @@ api.get('/documents/:id', (req, res) => {
+     res.status(404).json({ error: 'not found' });
+     return;
+   }
+-  const room = LoroRoom.resident(req.params.id);
++  const room = EsbtRoom.resident(req.params.id);
+   res.json({ document: doc, connections: room?.connections ?? 0 });
+ });
+ 
+@@ -45,8 +40,7 @@ api.delete('/documents/:id', (req, res) => {
+   // Remove the row first: any store still in flight for this document then
+   // finds it missing and becomes a no-op, rather than racing the teardown.
+   const deleted = deleteDocument(id);
+-  LoroRoom.discard(id);
+-  discardYjsDocument(id);
++  EsbtRoom.discard(id);
+ 
+   res.json({ deleted });
+ });
+@@ -67,8 +61,8 @@ api.get('/documents/:id/snapshot', (req, res) => {
+     return;
+   }
+ 
+-  const shallow = req.query.shallow === '1' && meta.engine === 'loro';
+-  const room = LoroRoom.resident(id);
++  const shallow = req.query.shallow === '1' && meta.engine === 'esbt';
++  const room = EsbtRoom.resident(id);
+   const bytes = room
+     ? shallow
+       ? room.shallowSnapshot()
+@@ -107,29 +101,22 @@ api.get('/documents/:id/export', (req, res) => {
+ });
+ 
+ function readMarkdown(id: string): string {
+-  // Prefer a resident replica: both engines persist on a debounce, so the
++  // Prefer a resident replica: the room persists on a debounce, so the
+   // stored row can trail what the editor is showing by several seconds.
+-  const room = LoroRoom.resident(id);
++  const room = EsbtRoom.resident(id);
+   if (room) return room.text();
+ 
+-  const live = yjsLiveText(id);
+-  if (live !== undefined) return live;
+-
+   const stored = getState(id);
+   if (!stored?.state || stored.state.length === 0) return '';
+ 
+-  if (stored.engine === 'yjs') {
+-    try {
+-      return yjsTextFromState(stored.state);
+-    } catch {
+-      return '';
+-    }
+-  }
++  // Rows written by the retired Loro/Yjs engines are unreadable without
++  // their runtimes; they export as empty rather than as garbage.
++  if (stored.engine !== 'esbt') return '';
+ 
+-  const doc = new LoroDoc();
++  const doc = new EsbtDoc();
+   try {
+     doc.import(stored.state);
+-    return doc.getText(TEXT_CONTAINER).toString();
++    return doc.getText();
+   } catch {
+     return '';
+   }
+diff --git a/server/src/loro-room.ts b/server/src/esbt-room.ts
+similarity index 81%
+rename from server/src/loro-room.ts
+rename to server/src/esbt-room.ts
+index c09b120..6189f64 100644
+--- a/server/src/loro-room.ts
++++ b/server/src/esbt-room.ts
+@@ -1,13 +1,10 @@
+-import { EphemeralStore, LoroDoc, VersionVector } from 'loro-crdt';
++import { EphemeralStore, EsbtDoc, VersionVector } from '@marks/esbt';
+ import type { WebSocket } from 'ws';
+ import { PERSIST_DEBOUNCE_MS, PERSIST_MAX_WAIT_MS, ROOM_IDLE_TIMEOUT_MS } from './config.js';
+ import { MSG_EPHEMERAL, MSG_SERVER_VV, MSG_SNAPSHOT, MSG_SYNCED, MSG_UPDATE, frame, unframe } from './protocol.js';
+ import { createDocument, documentExists, getState, saveState } from './store.js';
+ import { deriveTitle } from './title.js';
+ 
+-/** Container id holding the markdown source. Must match the client. */
+-export const TEXT_CONTAINER = 'markdown';
+-
+ /** Close code telling a client the document is gone, not that the link dropped. */
+ export const CLOSE_DOCUMENT_DELETED = 4404;
+ 
+@@ -15,16 +12,23 @@ export const CLOSE_DOCUMENT_DELETED = 4404;
+ const EPHEMERAL_TIMEOUT_MS = 30_000;
+ 
+ /**
+- * One in-memory Loro replica per document, shared by every connected client.
++ * The server replica's site id for one document. Stable across restarts —
++ * a fresh random site per boot would bloat every client's version vector
++ * and the reconnect URL (integration contract §6).
++ */
++const serverSiteId = (documentId: string) => `marks-server:${documentId}`;
++
++/**
++ * One in-memory ESBT replica per document, shared by every connected client.
+  *
+  * The server is a full peer rather than a dumb relay: it imports updates so it
+  * can answer cold opens with a single snapshot instead of a replay of history,
+  * which is what keeps document open latency flat as history grows.
+  */
+-export class LoroRoom {
+-  private static rooms = new Map<string, LoroRoom>();
++export class EsbtRoom {
++  private static rooms = new Map<string, EsbtRoom>();
+ 
+-  readonly doc = new LoroDoc();
++  readonly doc: EsbtDoc;
+   private readonly ephemeral = new EphemeralStore(EPHEMERAL_TIMEOUT_MS);
+   private readonly sockets = new Set<WebSocket>();
+ 
+@@ -35,30 +39,31 @@ export class LoroRoom {
+   private evictTimer: NodeJS.Timeout | null = null;
+ 
+   private constructor(readonly id: string) {
++    this.doc = new EsbtDoc({ siteId: serverSiteId(id) });
+     const stored = getState(id);
+     if (stored?.state && stored.state.length > 0) {
+       try {
+         this.doc.import(stored.state);
+       } catch (error) {
+-        console.error(`[loro] ${id}: stored snapshot could not be imported`, error);
++        console.error(`[esbt] ${id}: stored snapshot could not be imported`, error);
+       }
+     }
+   }
+ 
+-  static open(id: string): LoroRoom {
+-    let room = LoroRoom.rooms.get(id);
++  static open(id: string): EsbtRoom {
++    let room = EsbtRoom.rooms.get(id);
+     if (!room) {
+-      if (!documentExists(id)) createDocument({ id, engine: 'loro' });
+-      room = new LoroRoom(id);
+-      LoroRoom.rooms.set(id, room);
++      if (!documentExists(id)) createDocument({ id, engine: 'esbt' });
++      room = new EsbtRoom(id);
++      EsbtRoom.rooms.set(id, room);
+     }
+     room.cancelEviction();
+     return room;
+   }
+ 
+   /** The live replica if the room is resident, otherwise undefined. */
+-  static resident(id: string): LoroRoom | undefined {
+-    return LoroRoom.rooms.get(id);
++  static resident(id: string): EsbtRoom | undefined {
++    return EsbtRoom.rooms.get(id);
+   }
+ 
+   /**
+@@ -68,7 +73,7 @@ export class LoroRoom {
+    * is gone.
+    */
+   static discard(id: string): void {
+-    const room = LoroRoom.rooms.get(id);
++    const room = EsbtRoom.rooms.get(id);
+     if (!room) return;
+ 
+     room.discarded = true;
+@@ -80,11 +85,11 @@ export class LoroRoom {
+     for (const socket of room.sockets) socket.close(CLOSE_DOCUMENT_DELETED, 'document deleted');
+     room.sockets.clear();
+     room.ephemeral.destroy();
+-    LoroRoom.rooms.delete(id);
++    EsbtRoom.rooms.delete(id);
+   }
+ 
+   static async flushAll(): Promise<void> {
+-    for (const room of LoroRoom.rooms.values()) room.persistNow();
++    for (const room of EsbtRoom.rooms.values()) room.persistNow();
+   }
+ 
+   get connections(): number {
+@@ -92,7 +97,7 @@ export class LoroRoom {
+   }
+ 
+   text(): string {
+-    return this.doc.getText(TEXT_CONTAINER).toString();
++    return this.doc.getText();
+   }
+ 
+   snapshot(): Uint8Array {
+@@ -101,14 +106,10 @@ export class LoroRoom {
+ 
+   /**
+    * A history-trimmed snapshot: same document state, without the operations
+-   * needed to reconstruct older versions. Cheaper to ship and to load.
++   * needed to serve version-vector deltas. Cheaper to ship and to load.
+    */
+   shallowSnapshot(): Uint8Array {
+-    try {
+-      return this.doc.export({ mode: 'shallow-snapshot', frontiers: this.doc.frontiers() });
+-    } catch {
+-      return this.snapshot();
+-    }
++    return this.doc.export({ mode: 'shallow-snapshot' });
+   }
+ 
+   /**
+@@ -131,7 +132,7 @@ export class LoroRoom {
+         if (delta.length > 0) this.send(socket, MSG_UPDATE, delta);
+         sentDelta = true;
+       } catch (error) {
+-        console.error(`[loro] ${this.id}: unusable client version vector`, error);
++        console.error(`[esbt] ${this.id}: unusable client version vector`, error);
+       }
+     }
+     if (!sentDelta) this.send(socket, MSG_SNAPSHOT, this.snapshot());
+@@ -162,7 +163,7 @@ export class LoroRoom {
+         try {
+           this.doc.import(payload);
+         } catch (error) {
+-          console.error(`[loro] ${this.id}: rejected update`, error);
++          console.error(`[esbt] ${this.id}: rejected update`, error);
+           return;
+         }
+         this.broadcast(from, data);
+@@ -185,7 +186,7 @@ export class LoroRoom {
+           const missing = this.doc.export({ mode: 'update', from: vv });
+           if (missing.length > 0) this.send(from, MSG_UPDATE, missing);
+         } catch (error) {
+-          console.error(`[loro] ${this.id}: bad version vector`, error);
++          console.error(`[esbt] ${this.id}: bad version vector`, error);
+         }
+         break;
+       }
+@@ -226,7 +227,7 @@ export class LoroRoom {
+         this.discarded = true;
+       }
+     } catch (error) {
+-      console.error(`[loro] ${this.id}: persist failed`, error);
++      console.error(`[esbt] ${this.id}: persist failed`, error);
+       this.dirty = true;
+     }
+   }
+@@ -244,7 +245,7 @@ export class LoroRoom {
+       if (this.sockets.size > 0) return;
+       this.persistNow();
+       this.ephemeral.destroy();
+-      LoroRoom.rooms.delete(this.id);
++      EsbtRoom.rooms.delete(this.id);
+     }, ROOM_IDLE_TIMEOUT_MS);
+   }
+ 
+diff --git a/server/src/index.ts b/server/src/index.ts
+index ab15362..3287340 100644
+--- a/server/src/index.ts
++++ b/server/src/index.ts
+@@ -6,10 +6,9 @@ import path from 'node:path';
+ import { WebSocketServer } from 'ws';
+ import { api } from './api.js';
+ import { CLIENT_DIST, HOST, PORT } from './config.js';
+-import { LoroRoom } from './loro-room.js';
++import { EsbtRoom } from './esbt-room.js';
+ import { seedIfEmpty } from './seed.js';
+ import { databaseFile, getDocument, isRecentlyDeleted } from './store.js';
+-import { handleYjsConnection, hocuspocus } from './yjs-room.js';
+ 
+ const app = express();
+ app.use(compression());
+@@ -49,11 +48,11 @@ const server = http.createServer(app);
+ const wss = new WebSocketServer({ noServer: true });
+ 
+ /**
+- * `/collab/loro/<documentId>` — one socket per document.
+- * `/collab/yjs` — Hocuspocus multiplexes every document over one socket and
+- * carries the document name in the sync protocol, so no id appears in the path.
++ * `/collab/esbt/<documentId>` — one socket per document. Anything else —
++ * including the retired `/collab/loro` and `/collab/yjs` paths — is refused,
++ * so a stale client cannot hand an ESBT document an incompatible replica.
+  */
+-const COLLAB_PATH = /^\/collab\/(loro|yjs)(?:\/([\w-]{1,64}))?$/;
++const COLLAB_PATH = /^\/collab\/esbt\/([\w-]{1,64})$/;
+ 
+ server.on('upgrade', (request, socket, head) => {
+   const url = new URL(request.url ?? '/', 'http://localhost');
+@@ -64,28 +63,23 @@ server.on('upgrade', (request, socket, head) => {
+     return;
+   }
+ 
+-  const [, engine, documentId] = match;
+-  if (engine === 'loro' && !documentId) {
++  const [, documentId] = match;
++
++  // Documents created by the retired engines have incompatible binary
++  // formats. Connecting this protocol to one would hand it an empty replica,
++  // and the first edit would overwrite the stored state with an unreadable
++  // one. Unknown ids are still allowed through, so a URL can create a
++  // document.
++  const existing = getDocument(documentId);
++  if (existing && existing.engine !== 'esbt') {
+     socket.destroy();
+     return;
+   }
+-
+-  // The two CRDTs have incompatible binary formats. Connecting the wrong
+-  // protocol to an existing document would hand it an empty replica, and the
+-  // first edit would overwrite the stored state with an unreadable one.
+-  // Unknown ids are still allowed through, so a URL can create a document.
+-  if (documentId) {
+-    const existing = getDocument(documentId);
+-    if (existing && existing.engine !== engine) {
+-      socket.destroy();
+-      return;
+-    }
+-    // A client that was connected when the document was deleted will try to
+-    // reconnect; letting it through would recreate what was just deleted.
+-    if (!existing && isRecentlyDeleted(documentId)) {
+-      socket.destroy();
+-      return;
+-    }
++  // A client that was connected when the document was deleted will try to
++  // reconnect; letting it through would recreate what was just deleted.
++  if (!existing && isRecentlyDeleted(documentId)) {
++    socket.destroy();
++    return;
+   }
+ 
+   // Clients that already hold state announce it, so we can answer with a delta.
+@@ -93,11 +87,7 @@ server.on('upgrade', (request, socket, head) => {
+   const vv = have ? safeBase64(have) : undefined;
+ 
+   wss.handleUpgrade(request, socket, head, (ws) => {
+-    if (engine === 'loro') {
+-      LoroRoom.open(documentId).join(ws, vv);
+-    } else {
+-      handleYjsConnection(ws, request);
+-    }
++    EsbtRoom.open(documentId).join(ws, vv);
+   });
+ });
+ 
+@@ -116,9 +106,7 @@ async function shutdown(signal: string): Promise<void> {
+   if (shuttingDown) return;
+   shuttingDown = true;
+   console.log(`[marks] ${signal} received, flushing documents`);
+-  await LoroRoom.flushAll();
+-  hocuspocus.flushPendingStores();
+-  hocuspocus.closeConnections();
++  await EsbtRoom.flushAll();
+   server.close(() => process.exit(0));
+   setTimeout(() => process.exit(0), 3_000).unref();
+ }
+diff --git a/server/src/seed.ts b/server/src/seed.ts
+index 4e5ea73..97fa582 100644
+--- a/server/src/seed.ts
++++ b/server/src/seed.ts
+@@ -1,5 +1,4 @@
+-import { LoroDoc } from 'loro-crdt';
+-import { TEXT_CONTAINER } from './loro-room.js';
++import { EsbtDoc } from '@marks/esbt';
+ import { createDocument, documentExists, listDocuments, saveState } from './store.js';
+ import { deriveTitle } from './title.js';
+ 
+@@ -70,10 +69,9 @@ export function seedIfEmpty(): void {
+   if (listDocuments().length > 0) return;
+   if (documentExists('welcome')) return;
+ 
+-  createDocument({ id: 'welcome', engine: 'loro', title: 'Welcome to marks' });
+-  const doc = new LoroDoc();
+-  doc.getText(TEXT_CONTAINER).insert(0, WELCOME);
+-  doc.commit();
++  createDocument({ id: 'welcome', engine: 'esbt', title: 'Welcome to marks' });
++  const doc = new EsbtDoc({ siteId: 'marks-server:welcome' });
++  doc.setText(WELCOME);
+   saveState('welcome', doc.export({ mode: 'snapshot' }), deriveTitle(WELCOME), WELCOME.length);
+   console.log('[marks] seeded welcome document');
+ }
+diff --git a/server/src/store.ts b/server/src/store.ts
+index 58b6d29..506073c 100644
+--- a/server/src/store.ts
++++ b/server/src/store.ts
+@@ -4,7 +4,13 @@ import Database from 'better-sqlite3';
+ import { nanoid } from 'nanoid';
+ import { DATA_DIR, DB_PATH } from './config.js';
+ 
+-export type Engine = 'loro' | 'yjs';
++/**
++ * The engine a document's stored bytes belong to. Every new document is
++ * `esbt`; `loro` and `yjs` remain only as read-only markers on rows created
++ * before those engines were removed (their sockets are refused and their
++ * exports are empty — there is no converter between the binary formats).
++ */
++export type Engine = 'esbt' | 'loro' | 'yjs';
+ 
+ export interface DocumentRow {
+   id: string;
+diff --git a/server/src/yjs-room.ts b/server/src/yjs-room.ts
+deleted file mode 100644
+index 0fb6ca8..0000000
+--- a/server/src/yjs-room.ts
++++ /dev/null
+@@ -1,106 +0,0 @@
+-import { Database } from '@hocuspocus/extension-database';
+-import { Hocuspocus } from '@hocuspocus/server';
+-import type { IncomingMessage } from 'node:http';
+-import type { RawData, WebSocket } from 'ws';
+-import * as Y from 'yjs';
+-import { PERSIST_DEBOUNCE_MS, PERSIST_MAX_WAIT_MS } from './config.js';
+-import { createDocument, getState, isRecentlyDeleted, saveState } from './store.js';
+-import { deriveTitle } from './title.js';
+-
+-/** Shared type holding the markdown source. Must match the client. */
+-export const YJS_TEXT_KEY = 'markdown';
+-
+-/**
+- * Yjs rooms are served by Hocuspocus, which already implements the y-protocols
+- * sync/awareness handshake, debounced persistence and connection lifecycle. We
+- * only supply storage and title derivation.
+- */
+-export const hocuspocus = new Hocuspocus({
+-  name: 'marks',
+-  quiet: true,
+-  debounce: PERSIST_DEBOUNCE_MS,
+-  maxDebounce: PERSIST_MAX_WAIT_MS,
+-  extensions: [
+-    new Database({
+-      fetch: async ({ documentName }) => {
+-        const stored = getState(documentName);
+-        if (!stored) {
+-          if (isRecentlyDeleted(documentName)) {
+-            throw new Error(`document ${documentName} was deleted`);
+-          }
+-          createDocument({ id: documentName, engine: 'yjs' });
+-          return null;
+-        }
+-        // The two CRDTs have incompatible binary formats; opening a Loro
+-        // document with this engine would hand it an empty replica and let it
+-        // overwrite the stored state.
+-        if (stored.engine !== 'yjs') {
+-          throw new Error(`document ${documentName} is a ${stored.engine} document`);
+-        }
+-        return stored.state ?? null;
+-      },
+-      store: async ({ documentName, state, document }) => {
+-        const markdown = document.getText(YJS_TEXT_KEY).toString();
+-        saveState(documentName, state, deriveTitle(markdown), markdown.length);
+-      },
+-    }),
+-  ],
+-});
+-
+-/**
+- * Bridge a raw `ws` socket into Hocuspocus.
+- *
+- * Since v4 Hocuspocus does not attach its own socket listeners — the
+- * integration owns the transport and pushes frames in. Documents are
+- * multiplexed over this one socket, with the document name carried in the
+- * sync protocol rather than the URL.
+- */
+-export function handleYjsConnection(socket: WebSocket, request: IncomingMessage): void {
+-  const client = hocuspocus.handleConnection(socket as never, request as never);
+-
+-  socket.on('message', (data: RawData) => {
+-    client.handleMessage(toUint8Array(data));
+-  });
+-
+-  socket.on('close', (code: number, reason: Buffer) => {
+-    client.handleClose({ code, reason: reason.toString() } as never);
+-  });
+-
+-  socket.on('error', () => {
+-    client.handleClose({ code: 1011, reason: 'socket error' } as never);
+-  });
+-}
+-
+-function toUint8Array(data: RawData): Uint8Array {
+-  if (Buffer.isBuffer(data)) return new Uint8Array(data);
+-  if (Array.isArray(data)) return new Uint8Array(Buffer.concat(data));
+-  return new Uint8Array(data as ArrayBuffer);
+-}
+-
+-/**
+- * Markdown from the live document, if Hocuspocus still holds it.
+- *
+- * Its store runs on a debounce, so the row in SQLite can trail the editor by
+- * seconds; anything reading a document for a user needs the resident copy.
+- */
+-export function yjsLiveText(id: string): string | undefined {
+-  const document = hocuspocus.documents.get(id);
+-  return document?.getText(YJS_TEXT_KEY).toString();
+-}
+-
+-/**
+- * Drop a deleted document: close its connections and forget it, so nothing
+- * writes it back out after the row is gone.
+- */
+-export function discardYjsDocument(id: string): void {
+-  hocuspocus.closeConnections(id);
+-  hocuspocus.documents.delete(id);
+-}
+-
+-export function yjsTextFromState(state: Uint8Array): string {
+-  const doc = new Y.Doc();
+-  Y.applyUpdate(doc, state);
+-  const text = doc.getText(YJS_TEXT_KEY).toString();
+-  doc.destroy();
+-  return text;
+-}
+-- 
+2.43.0
+

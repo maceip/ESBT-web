@@ -1,0 +1,3472 @@
+From aa4c9064ff7ba733ed1e5ee46937c9aa02ab2aae Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Fri, 21 Aug 2026 23:30:04 +0000
+Subject: [PATCH 1/5] Complete @marks/esbt: TypeScript ESBT engine with
+ contract tests
+
+Replaces the partial fragments (vector/undo/tree referencing modules that
+did not exist) with the full engine from maceip/ESBT-web ts/: weights and
+CREATE_WEIGHT with strict-separation hardening, order-statistic RB tree,
+Algorithm 3 with pending deletes and the delete log, snapshot / shallow /
+update codecs, EsbtDoc with origin-tagged transactions and weight anchors,
+per-peer UndoManager with an optional merge window, and the TTL
+EphemeralStore. The package now builds to dist/ so Vite and Node consume
+plain ESM, and ships the 36-test contract suite the integration document
+lists.
+---
+ esbt/README.md            | 118 +++----
+ esbt/package.json         |  24 +-
+ esbt/src/api.ts           |  53 ++-
+ esbt/src/codec.ts         | 133 ++++++++
+ esbt/src/constructors.ts  |  32 +-
+ esbt/src/contract.test.ts | 701 ++++++++++++++++++++++++++++++++++++++
+ esbt/src/doc.ts           | 590 ++++++++++++++++++++++++++++++++
+ esbt/src/encode.ts        | 198 +++++++++++
+ esbt/src/ephemeral.ts     | 184 +++++++++-
+ esbt/src/index.ts         |  29 +-
+ esbt/src/ops.ts           | 179 ++++++++++
+ esbt/src/tree.ts          | 383 ++++++++++++++++++---
+ esbt/src/undo.ts          |  75 +++-
+ esbt/src/vector.ts        |  12 +-
+ esbt/src/weight.ts        | 393 +++++++++++++++++++++
+ esbt/tsconfig.build.json  |  10 +
+ esbt/tsconfig.json        |   9 +-
+ 17 files changed, 2969 insertions(+), 154 deletions(-)
+ create mode 100644 esbt/src/codec.ts
+ create mode 100644 esbt/src/contract.test.ts
+ create mode 100644 esbt/src/doc.ts
+ create mode 100644 esbt/src/encode.ts
+ create mode 100644 esbt/src/ops.ts
+ create mode 100644 esbt/src/weight.ts
+ create mode 100644 esbt/tsconfig.build.json
+
+diff --git a/esbt/README.md b/esbt/README.md
+index b0e05ff..d4009a2 100644
+--- a/esbt/README.md
++++ b/esbt/README.md
+@@ -1,18 +1,28 @@
+ # `@marks/esbt`
+ 
+-API contract for using ESBT as the only CRDT in [marks](https://github.com/maceip/marks).
++The ESBT sequence CRDT (Mechaoui & Imine, arXiv:2607.28101) — the only CRDT
++engine in [marks](https://github.com/maceip/marks). Pure TypeScript, no WASM,
++synchronous mutations, UTF-16 indices; runs on the main thread in the browser
++and in Node. The canonical implementation lives in
++[maceip/ESBT-web `ts/`](https://github.com/maceip/ESBT-web) next to the
++Rust/wasm reference; this workspace is its build inside marks.
+ 
+-The algorithm lives in [maceip/ESBT-web](https://github.com/maceip/ESBT-web) (Mechaoui & Imine, arXiv:2607.28101). This package is the surface the markdown editor will call. Implement the types in `src/api.ts` and `src/ephemeral.ts`; export the constructors named in `src/constructors.ts`.
++The API is the contract in [`docs/ESBT-INTEGRATION.md`](../docs/ESBT-INTEGRATION.md).
++Everything the contract names is implemented, plus the three additions the
++Loro/Yjs coverage audit forced (each documented in `src/api.ts`):
+ 
+-Marks will **not** ask ESBT to speak WebSocket, persist to SQLite, or bind CodeMirror. Those stay in the app.
++- `EphemeralStore.keys()` — the server room gates its first presence frame on it
++- `UndoManagerOptions.mergeIntervalMs` — keystroke-burst undo grouping
++  (Loro's merge interval / Yjs's `captureTimeout` equivalent; marks passes 500)
++- `EsbtDoc.indexToAnchor` / `anchorToIndex` — weight-stable anchors (§7)
+ 
+-## What marks will call
++## What marks calls
+ 
+ ```ts
+ import { EsbtDoc, EphemeralStore, UndoManager, VersionVector } from '@marks/esbt';
+ 
+ const doc = new EsbtDoc();
+-const undo = new UndoManager(doc);
++const undo = new UndoManager(doc, { mergeIntervalMs: 500 });
+ const presence = new EphemeralStore(30_000);
+ 
+ doc.subscribe((event) => {
+@@ -33,67 +43,51 @@ const delta = doc.export({ mode: 'update', from: VersionVector.decode(peerVv) })
+ doc.import(payload);
+ ```
+ 
+-Index every `insert` / `delete` / `replaceRange` in **UTF-16 code units**, the same as `string.length` and CodeMirror 6.
++## Building and testing
+ 
+-## Why each piece exists
++The package compiles to `dist/` (plain ESM plus declarations) so both Vite and
++the Node server consume it without loaders:
+ 
+-| Surface | Who uses it | Why it is not optional |
+-| --- | --- | --- |
+-| `EsbtDoc.insert/delete/replaceRange/setText` | CodeMirror sync, preview checkboxes, file import | The editor never talks in weights |
+-| `transact(fn, origin)` | Sync plugin, undo | `"editor"` origin must not echo back into CodeMirror or the replica corrupts |
+-| `subscribe` / `subscribeLocalUpdates` | Preview, wire | Local-first: apply, then emit bytes |
+-| `export({ mode: 'snapshot' })` | SQLite, IndexedDB | Server is a full replica; cold open is one blob |
+-| `export({ mode: 'shallow-snapshot' })` | `GET /api/documents/:id/snapshot?shallow=1` | Payload tracks document size, not history length |
+-| `export({ mode: 'update', from })` + `oplogVersion` | Reconnect URL `?vv=` | Warm open / offline resync is a delta |
+-| `import` | HTTP snapshot, WS frames, peer merge | Must **merge**, never clobber newer local ops |
+-| `UndoManager` | Mod-Z | Per-peer; must not revert a collaborator. Emits new ops |
+-| `EphemeralStore` | Avatars, remote carets | Not in the paper; 30s TTL; never persisted |
+-
+-## Paper requirements that the editor depends on
+-
+-Keep these from ESBT §3–6. If they slip, two windows of the same doc diverge.
+-
+-1. Weights totally ordered by `(f, sn, sc, site)`.
+-2. `CREATE_WEIGHT` + `NEWSEQ` as specified; `Dmax` bounds the fraction layer.
+-3. `INS(ω, e, c)` always ready; `DEL(ω, c)` waits for that insert, then is idempotent via the delete log.
+-4. Reused weights get a new `c`. `c` does not change order.
+-5. Same integrated op set ⇒ identical `getText()` (SEC).
+-
+-## Encoding rules
+-
+-- Snapshots and updates are `Uint8Array`. A single `import` must accept all three export modes (a type tag in the first bytes is enough).
+-- `VersionVector.encode()` should stay well under 4 KiB for realistic peer counts; marks omits `vv` from the URL above that and asks for a snapshot.
+-- Bytes are opaque to marks. Do not require JSON on the wire.
+-- `import` of a payload this replica already applied is a no-op.
+-
+-## Invariants marks will test
+-
+-The smoke suite and a worker benchmark will assert:
+-
+-- Two replicas exchanging only updates converge on the same string.
+-- Offline edits on A, then reconnect, appear on B (delta, not snapshot-only).
+-- A delete delivered before its insert does not drop the insert or throw.
+-- Concurrent inserts between the same pair of characters are both present, stably ordered.
+-- Undo on A removes A's text and leaves B's concurrent text.
+-- `replaceRange` while the editor is unmounted (preview-only) still updates `getText()` and syncs.
+-- `setText` then `export({ mode: 'snapshot' })` then `import` on a fresh doc reproduces the string.
+-- Fork: snapshot → two docs → N edits each → exchange updates → equal text.
+-
+-## Out of scope (marks implements)
++```bash
++npm run build --workspace=@marks/esbt
++npm test    --workspace=@marks/esbt   # 36 contract tests, node --test
++```
+ 
+-- WebSocket framing (`tag` byte + payload; see `client/src/collab/protocol.ts`)
+-- Room lifecycle, SQLite, HTTP snapshot route
+-- CodeMirror two-way sync and remote cursor decorations
+-- Auth, access control, engine migration from old Loro/Yjs blobs
++The root `npm run dev` / `npm run build` build this workspace first. After
++editing engine sources during `npm run dev`, rebuild this workspace to pick
++the changes up.
+ 
+-## Suggested file split on the ESBT-web side
++## File split
+ 
+ ```
+-weight.ts        CREATE_WEIGHT, NEWSEQ, compare
+-tree.ts          order-statistic red-black tree of (weight, content)
+-ops.ts           INS/DEL, pending queue, delete log, CounterMap
+-encode.ts        snapshot / shallow / update / version vector
+-doc.ts           EsbtDoc — index API + transact + subscriptions
+-undo.ts          UndoManager
+-ephemeral.ts     EphemeralStore
++src/weight.ts     Fraction / Weight / total order (Def. 2), NEWSEQ (Alg. 1),
++                  CREATE_WEIGHT + Tracker (Alg. 2, Def. 4)
++src/tree.ts       order-statistic red-black tree of (weight, unit, counter)
++src/ops.ts        INS/DEL, pending queue, delete log, site table, op codec
++src/codec.ts      varint writer/reader, payload tags, version map codec
++src/encode.ts     snapshot / shallow-snapshot / update payloads
++src/vector.ts     VersionVector (site → max seq)
++src/doc.ts        EsbtDoc — index API, transact, import/export, subscriptions,
++                  anchors, undo hooks
++src/undo.ts       UndoManager
++src/ephemeral.ts  EphemeralStore
++src/api.ts        contract types
++src/constructors.ts  compile-time contract assertion
++src/contract.test.ts invariants from the integration document
+ ```
++
++## Paper rules the tests pin
++
++1. Weights totally ordered by `(f, sn, sc, site)`.
++2. `CREATE_WEIGHT` + `NEWSEQ`; `Dmax` bounds the fraction layer
++   (Situation 1: 3/7 rejected at Dmax = 5).
++3. `INS(ω, e, c)` always ready; `DEL(ω, c)` waits for its insert, then is
++   idempotent via the delete log.
++4. Reused weights get a new `c`; `c` never affects order.
++5. Same integrated op set ⇒ identical `getText()` (SEC), any delivery order —
++   fuzzed across three sites with shuffled delivery.
++
++Four hardening corrections to the reference algorithm (strict mediant
++separation, neighbour-aware sn ladder, uncapped NEWSEQ retry at depth
++exhaustion, twin-pinch gap widening) are documented inline in `src/weight.ts`
++and in the coverage audit in ESBT-web.
+diff --git a/esbt/package.json b/esbt/package.json
+index 8454a1c..194661b 100644
+--- a/esbt/package.json
++++ b/esbt/package.json
+@@ -3,19 +3,27 @@
+   "version": "0.1.0",
+   "private": true,
+   "type": "module",
+-  "description": "ESBT sequence CRDT — editor API contract for marks (sync, merge, reconcile, undo, presence).",
+-  "main": "./src/index.ts",
+-  "types": "./src/index.ts",
++  "description": "ESBT sequence CRDT — the only CRDT engine in marks (doc + sync + merge, per-peer undo, presence).",
++  "main": "./dist/index.js",
++  "types": "./dist/index.d.ts",
+   "exports": {
+     ".": {
+-      "types": "./src/index.ts",
+-      "import": "./src/index.ts",
+-      "default": "./src/index.ts"
++      "types": "./dist/index.d.ts",
++      "import": "./dist/index.js",
++      "default": "./dist/index.js"
+     }
+   },
+-  "files": ["src"],
++  "files": [
++    "dist",
++    "src"
++  ],
+   "scripts": {
+-    "test": "node --experimental-strip-types --test src/contract.test.ts",
++    "build": "tsc -p tsconfig.build.json",
++    "test": "npm run build && node --test dist/contract.test.js",
+     "typecheck": "tsc --noEmit -p tsconfig.json"
++  },
++  "devDependencies": {
++    "@types/node": "^22.15.0",
++    "typescript": "^5.9.3"
+   }
+ }
+diff --git a/esbt/src/api.ts b/esbt/src/api.ts
+index 73a20f7..fe543c4 100644
+--- a/esbt/src/api.ts
++++ b/esbt/src/api.ts
+@@ -13,6 +13,18 @@
+  *
+  * Implementation language: TypeScript, runs on the main thread in the browser
+  * and in Node. No WASM. All mutating methods are synchronous.
++ *
++ * Additions over the original contract draft, discovered while replacing the
++ * loro/yjs engines (each is called out on its member):
++ *
++ *   - `EphemeralStore.keys()` — the server room gates its first presence
++ *     frame on it (`ephemeral.keys().length > 0`).
++ *   - `UndoManagerOptions.mergeIntervalMs` — both previous engines group a
++ *     burst of keystrokes into one undo step (Loro's UndoManager interval,
++ *     Yjs's captureTimeout). Without it, Mod-Z per keystroke.
++ *   - `EsbtDoc.indexToAnchor` / `anchorToIndex` — weight-stable text anchors,
++ *     requested by the integration document (§7) for comments and future
++ *     range presence.
+  */
+ 
+ /** Replica / site identifier. Opaque, comparable, stable for the life of a doc instance. */
+@@ -38,6 +50,18 @@ export interface EsbtTextRange {
+   to: number;
+ }
+ 
++/**
++ * A weight-stable position. Survives concurrent edits elsewhere in the
++ * document, which a UTF-16 index does not; the intended carrier for comments
++ * and long-lived range presence (integration document §7).
++ */
++export interface EsbtAnchor {
++  /** Canonical weight string of the anchored item (`EsbtItemId.weight`). */
++  weight: string;
++  /** Offset inside a multi-unit item; always 0 while items are single units. */
++  offset: number;
++}
++
+ /**
+  * Change notification after the local document has been updated.
+  *
+@@ -197,20 +221,41 @@ export interface EsbtDoc {
+    * that already holds a causal prefix of this one.
+    */
+   subscribeLocalUpdates(listener: (update: Uint8Array) => void): () => void;
++
++  /**
++   * Weight-stable anchor for the item at `index`; the END sentinel at or
++   * past the end. Contract addition for §7 (comments, range presence).
++   */
++  indexToAnchor(index: number): EsbtAnchor;
++  /**
++   * Current index of an anchor; a deleted anchor resolves to the index its
++   * item would occupy today, so ranges collapse instead of drifting.
++   */
++  anchorToIndex(anchor: EsbtAnchor): number;
+ }
+ 
+ export interface EsbtDocStatic {
+   new (config?: EsbtConfig): EsbtDoc;
+ }
+ 
++/** Options for `UndoManager`. Contract addition; both replaced engines had an equivalent. */
++export interface UndoManagerOptions {
++  /**
++   * Group local transacts that land within this window into one undo step —
++   * one Mod-Z per typing burst, not per keystroke. 0 (default) keeps the
++   * strict contract behaviour of one transact = one step. Marks passes 500.
++   */
++  mergeIntervalMs?: number;
++}
++
+ /**
+  * Per-peer undo. Only operations this replica generated (not imports)
+  * are undoable. Undoing must generate *new* ops (a delete of our insert,
+  * or a re-insert of a deleted item with a new `c`) so peers converge.
+  *
+- * One `transact` = one undo step. Redo is the inverse stack.
+- * After a remote change, the undo stack stays valid (CRDT undo, not
+- * CodeMirror history).
++ * One `transact` = one undo step (see `UndoManagerOptions.mergeIntervalMs`).
++ * Redo is the inverse stack. After a remote change, the undo stack stays
++ * valid (CRDT undo, not CodeMirror history).
+  */
+ export interface UndoManager {
+   canUndo(): boolean;
+@@ -221,7 +266,7 @@ export interface UndoManager {
+ }
+ 
+ export interface UndoManagerStatic {
+-  new (doc: EsbtDoc): UndoManager;
++  new (doc: EsbtDoc, options?: UndoManagerOptions): UndoManager;
+ }
+ 
+ /**
+diff --git a/esbt/src/codec.ts b/esbt/src/codec.ts
+new file mode 100644
+index 0000000..90d6507
+--- /dev/null
++++ b/esbt/src/codec.ts
+@@ -0,0 +1,133 @@
++/**
++ * Binary primitives shared by every payload the engine puts on the wire or
++ * on disk. All integers are unsigned LEB128 varints (zigzag for the signed
++ * fields of a weight); strings are length-prefixed UTF-8. Payloads are opaque
++ * to marks — the first byte is a type tag so one `import` accepts them all.
++ */
++
++export const TAG_SNAPSHOT = 1;
++export const TAG_SHALLOW = 2;
++export const TAG_UPDATE = 3;
++export const TAG_VV = 4;
++export const TAG_EPHEMERAL = 5;
++
++const textEncoder = new TextEncoder();
++const textDecoder = new TextDecoder();
++
++export class Writer {
++  private buf = new Uint8Array(256);
++  private len = 0;
++
++  private grow(extra: number): void {
++    if (this.len + extra <= this.buf.length) return;
++    let next = this.buf.length * 2;
++    while (next < this.len + extra) next *= 2;
++    const grown = new Uint8Array(next);
++    grown.set(this.buf.subarray(0, this.len));
++    this.buf = grown;
++  }
++
++  u8(value: number): void {
++    this.grow(1);
++    this.buf[this.len++] = value & 0xff;
++  }
++
++  /** Unsigned LEB128. Values must be safe non-negative integers. */
++  uint(value: number): void {
++    if (!Number.isSafeInteger(value) || value < 0) {
++      throw new Error(`esbt: cannot encode ${value} as uint`);
++    }
++    this.grow(10);
++    while (value >= 0x80) {
++      this.buf[this.len++] = (value & 0x7f) | 0x80;
++      value = Math.floor(value / 128);
++    }
++    this.buf[this.len++] = value;
++  }
++
++  /** Zigzag-encoded signed integer. */
++  int(value: number): void {
++    this.uint(value < 0 ? -value * 2 - 1 : value * 2);
++  }
++
++  bytes(data: Uint8Array): void {
++    this.uint(data.length);
++    this.grow(data.length);
++    this.buf.set(data, this.len);
++    this.len += data.length;
++  }
++
++  str(value: string): void {
++    this.bytes(textEncoder.encode(value));
++  }
++
++  done(): Uint8Array {
++    return this.buf.slice(0, this.len);
++  }
++}
++
++export class Reader {
++  private pos = 0;
++
++  constructor(private readonly buf: Uint8Array) {}
++
++  get remaining(): number {
++    return this.buf.length - this.pos;
++  }
++
++  u8(): number {
++    if (this.pos >= this.buf.length) throw new Error('esbt: truncated payload');
++    return this.buf[this.pos++];
++  }
++
++  uint(): number {
++    let value = 0;
++    let shift = 1;
++    for (;;) {
++      const byte = this.u8();
++      value += (byte & 0x7f) * shift;
++      if ((byte & 0x80) === 0) break;
++      shift *= 128;
++      if (shift > Number.MAX_SAFE_INTEGER) throw new Error('esbt: varint overflow');
++    }
++    if (!Number.isSafeInteger(value)) throw new Error('esbt: varint overflow');
++    return value;
++  }
++
++  int(): number {
++    const raw = this.uint();
++    return raw % 2 === 0 ? raw / 2 : -(raw + 1) / 2;
++  }
++
++  bytes(): Uint8Array {
++    const length = this.uint();
++    if (this.pos + length > this.buf.length) throw new Error('esbt: truncated payload');
++    const out = this.buf.subarray(this.pos, this.pos + length);
++    this.pos += length;
++    return out;
++  }
++
++  str(): string {
++    return textDecoder.decode(this.bytes());
++  }
++}
++
++/** site → max seq map, ordered by site for a canonical encoding. */
++export function writeVersion(w: Writer, next: Map<string, number>): void {
++  const sites = [...next.keys()].sort();
++  w.uint(sites.length);
++  for (const site of sites) {
++    w.str(site);
++    w.uint(next.get(site) ?? 0);
++  }
++}
++
++export function readVersion(r: Reader): Map<string, number> {
++  const count = r.uint();
++  const next = new Map<string, number>();
++  for (let i = 0; i < count; i++) {
++    const site = r.str();
++    next.set(site, r.uint());
++  }
++  return next;
++}
+diff --git a/esbt/src/constructors.ts b/esbt/src/constructors.ts
+index 51a52ec..c9f2c23 100644
+--- a/esbt/src/constructors.ts
++++ b/esbt/src/constructors.ts
+@@ -1,11 +1,29 @@
+ /**
+- * Values the package must export by these exact names.
+- * Marks will do: `import { EsbtDoc, VersionVector, UndoManager, EphemeralStore } from '@marks/esbt'`.
++ * Static contract check: the values the package exports must satisfy the
++ * constructor interfaces by these exact names. Marks does:
++ *
++ *   import { EsbtDoc, VersionVector, UndoManager, EphemeralStore } from '@marks/esbt';
++ *
++ * This module compiles only while that binding stays true. It exports
++ * nothing and is never imported at runtime.
+  */
+-import type { EsbtDocStatic, UndoManagerStatic, VersionVectorStatic } from './api.js';
++
++import type {
++  EsbtDocStatic,
++  UndoManagerStatic,
++  VersionVectorStatic,
++} from './api.js';
+ import type { EphemeralStoreStatic } from './ephemeral.js';
++import { EphemeralStore, EsbtDoc, UndoManager, VersionVector } from './index.js';
++
++const esbtDoc: EsbtDocStatic = EsbtDoc;
++const versionVector: VersionVectorStatic = VersionVector;
++const undoManager: UndoManagerStatic = UndoManager;
++const ephemeralStore: EphemeralStoreStatic = EphemeralStore;
+ 
+-export declare const EsbtDoc: EsbtDocStatic;
+-export declare const VersionVector: VersionVectorStatic;
+-export declare const UndoManager: UndoManagerStatic;
+-export declare const EphemeralStore: EphemeralStoreStatic;
++export type ContractHolds = [
++  typeof esbtDoc,
++  typeof versionVector,
++  typeof undoManager,
++  typeof ephemeralStore,
++];
+diff --git a/esbt/src/contract.test.ts b/esbt/src/contract.test.ts
+new file mode 100644
+index 0000000..34a9596
+--- /dev/null
++++ b/esbt/src/contract.test.ts
+@@ -0,0 +1,701 @@
++/**
++ * Contract tests: every invariant `docs/ESBT-INTEGRATION.md` says marks will
++ * assert, plus the paper's worked situations from the Rust reference suite,
++ * plus the additions this implementation made to the contract
++ * (`EphemeralStore.keys`, undo merge grouping, anchors).
++ */
++
++import assert from 'node:assert/strict';
++import { test } from 'node:test';
++
++import { EphemeralStore, EsbtDoc, UndoManager, VersionVector } from './index.js';
++import { Allocator, cmpWeight, fraction, newseq, weight } from './weight.js';
++
++/** Pipe every local update of `from` straight into `to`. */
++function wire(from: EsbtDoc, to: EsbtDoc): () => void {
++  return from.subscribeLocalUpdates((update) => to.import(update));
++}
++
++/** Deterministic PRNG (mulberry32) for fuzz cases. */
++function rng(seed: number): () => number {
++  let state = seed >>> 0;
++  return () => {
++    state = (state + 0x6d2b79f5) >>> 0;
++    let t = Math.imul(state ^ (state >>> 15), 1 | state);
++    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
++    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
++  };
++}
++
++/* ---------------------------------------------------------------- weights */
++
++test('weight order follows Definition 2', () => {
++  const a = weight(fraction(1, 4), 0, [0], 'site1');
++  const mid = weight(fraction(1, 4), 0, [0, 5], 'site1');
++  const b = weight(fraction(1, 4), 1, [0], 'site1');
++  const c = weight(fraction(2, 3), 0, [0], 'site1');
++  assert.ok(cmpWeight(a, mid) < 0 && cmpWeight(mid, b) < 0 && cmpWeight(b, c) < 0);
++  const d = weight(fraction(1, 4), 1, [0], 'site2');
++  assert.ok(cmpWeight(b, d) < 0);
++});
++
++test('NEWSEQ reproduces the paper examples', () => {
++  assert.deepEqual(newseq([3], [7], 10, 3, 'x'), [5]);
++  assert.deepEqual(newseq([3], [4], 10, 3, 'x'), [3, 5]);
++});
++
++test('Situation 1: the mediant 3/7 is rejected at Dmax = 5', () => {
++  const alloc = new Allocator(5, 10, 3);
++  const w1 = weight(fraction(1, 4), 0, [0], 'a');
++  const w2 = weight(fraction(2, 3), 0, [0], 'a');
++  const w = alloc.createWeight(w1, w2, 'a')!;
++  assert.deepEqual(w.f, fraction(1, 4));
++  assert.equal(w.sn, 1);
++});
++
++test('Situation 2: the sn ladder walks right +1 / left −1', () => {
++  const alloc = new Allocator(5, 10, 3);
++  const w1 = weight(fraction(1, 4), 0, [0], 'a');
++  const w2 = weight(fraction(2, 3), 0, [0], 'a');
++  const r1 = alloc.createWeight(w1, w2, 'a')!;
++  const r2 = alloc.createWeight(r1, w2, 'a')!;
++  const begin = weight(fraction(0, 1), 0, [0], '');
++  const l1 = alloc.createWeight(begin, w1, 'a')!;
++  const l2 = alloc.createWeight(begin, l1, 'a')!;
++  assert.deepEqual([r1.sn, r2.sn, l1.sn, l2.sn], [1, 2, -1, -2]);
++  assert.ok(cmpWeight(l2, l1) < 0 && cmpWeight(l1, w1) < 0);
++  assert.ok(cmpWeight(w1, r1) < 0 && cmpWeight(r1, r2) < 0 && cmpWeight(r2, w2) < 0);
++});
++
++test('Situation 3: the sequence path splits equal (f, sn)', () => {
++  const alloc = new Allocator(5, 10, 3);
++  const w0 = weight(fraction(1, 4), 0, [0], 'a');
++  const w1 = weight(fraction(1, 4), 1, [0], 'a');
++  const mid = alloc.createWeight(w0, w1, 'b')!;
++  assert.ok(cmpWeight(w0, mid) < 0 && cmpWeight(mid, w1) < 0);
++  assert.equal(mid.sn, 0);
++});
++
++test('fraction layer assigns the mediant while it fits', () => {
++  const alloc = new Allocator(10, 10, 3);
++  const w1 = weight(fraction(1, 3), 0, [0], 'a');
++  const w2 = weight(fraction(1, 2), 0, [0], 'a');
++  const w = alloc.createWeight(w1, w2, 'a')!;
++  assert.deepEqual(w.f, fraction(2, 5));
++  assert.equal(w.sn, 0);
++});
++
++/* --------------------------------------------------------------- editing */
++
++test('local editing: insert, delete, replaceRange, setText, clamping', () => {
++  const doc = new EsbtDoc();
++  doc.insert(0, 'hello world');
++  assert.equal(doc.getText(), 'hello world');
++  assert.equal(doc.length, 11);
++
++  doc.delete(5, 6);
++  assert.equal(doc.getText(), 'hello');
++
++  doc.replaceRange(0, 5, 'goodbye');
++  assert.equal(doc.getText(), 'goodbye');
++
++  doc.setText('fresh');
++  assert.equal(doc.getText(), 'fresh');
++
++  // Out of range clamps, never throws.
++  doc.insert(999, '!');
++  assert.equal(doc.getText(), 'fresh!');
++  doc.delete(999, 5);
++  assert.equal(doc.getText(), 'fresh!');
++  doc.delete(-5, 2);
++  assert.equal(doc.getText(), 'esh!');
++});
++
++test('surrogate pairs survive the wire unit-for-unit', () => {
++  const a = new EsbtDoc({ siteId: 'a' });
++  const b = new EsbtDoc({ siteId: 'b' });
++  const unwire = wire(a, b);
++  a.insert(0, 'x🎉y');
++  a.delete(1, 1); // deletes only the high surrogate — the editor's business
++  unwire();
++  assert.equal(b.getText(), a.getText());
++  const c = new EsbtDoc();
++  c.import(a.export({ mode: 'snapshot' }));
++  assert.equal(c.getText(), a.getText());
++});
++
++/* --------------------------------------------------------- convergence */
++
++test('two replicas exchanging only updates converge', () => {
++  const a = new EsbtDoc({ siteId: 'a' });
++  const b = new EsbtDoc({ siteId: 'b' });
++  const ua = wire(a, b);
++  const ub = wire(b, a);
++
++  a.insert(0, 'shared ');
++  b.insert(b.length, 'ground');
++  a.insert(0, '# ');
++  b.delete(0, 1);
++
++  ua();
++  ub();
++  assert.equal(a.getText(), b.getText());
++});
++
++test('offline edits appear on the peer via a version-vector delta, not a snapshot', () => {
++  const a = new EsbtDoc({ siteId: 'a' });
++  const b = new EsbtDoc({ siteId: 'b' });
++  a.insert(0, 'base');
++  b.import(a.export({ mode: 'update' }));
++  assert.equal(b.getText(), 'base');
++
++  // A goes offline and keeps typing.
++  a.insert(4, ' + offline edits');
++
++  // Reconnect: B announces what it has, A ships only the difference.
++  const delta = a.export({ mode: 'update', from: b.oplogVersion() });
++  assert.ok(delta.byteLength > 0);
++  b.import(delta);
++  assert.equal(b.getText(), 'base + offline edits');
++
++  // The delta contains nothing B already had.
++  const nothing = a.export({ mode: 'update', from: b.oplogVersion() });
++  b.import(nothing);
++  assert.equal(b.getText(), 'base + offline edits');
++});
++
++test('a delete delivered before its insert waits, then applies', () => {
++  const a = new EsbtDoc({ siteId: 'a' });
++  const b = new EsbtDoc({ siteId: 'b' });
++
++  const updates: Uint8Array[] = [];
++  const stop = a.subscribeLocalUpdates((u) => updates.push(u));
++  a.insert(0, 'A');
++  a.delete(0, 1);
++  stop();
++  assert.equal(updates.length, 2);
++
++  // Deliver the delete first: it must neither drop the insert nor throw.
++  b.import(updates[1]);
++  assert.equal(b.getText(), '');
++  b.import(updates[0]);
++  assert.equal(b.getText(), '');
++  assert.equal(a.getText(), '');
++});
++
++test('concurrent inserts between the same pair are both present, stably ordered', () => {
++  const a = new EsbtDoc({ siteId: 'a' });
++  const b = new EsbtDoc({ siteId: 'b' });
++  const c = new EsbtDoc({ siteId: 'c' });
++
++  a.insert(0, 'XY');
++  const seed = a.export({ mode: 'update' });
++  b.import(seed);
++  c.import(seed);
++
++  const fromA: Uint8Array[] = [];
++  const fromB: Uint8Array[] = [];
++  const fromC: Uint8Array[] = [];
++  a.subscribeLocalUpdates((u) => fromA.push(u));
++  b.subscribeLocalUpdates((u) => fromB.push(u));
++  c.subscribeLocalUpdates((u) => fromC.push(u));
++
++  a.insert(1, '1');
++  b.insert(1, '2');
++  c.insert(1, '3');
++
++  // Every replica sees the others' ops in a different order.
++  for (const u of [...fromB, ...fromC]) a.import(u);
++  for (const u of [...fromC, ...fromA]) b.import(u);
++  for (const u of [...fromA, ...fromB]) c.import(u);
++
++  assert.equal(a.getText(), b.getText());
++  assert.equal(b.getText(), c.getText());
++  assert.equal(a.getText().length, 5);
++  assert.ok(a.getText().startsWith('X') && a.getText().endsWith('Y'));
++});
++
++test('same integrated op set ⇒ identical text, any delivery order (fuzz)', () => {
++  for (const seed of [1, 42, 20260821]) {
++    const random = rng(seed);
++    const sites = ['a', 'b', 'c'];
++    const docs = sites.map((siteId) => new EsbtDoc({ siteId }));
++    const outbox: Uint8Array[][] = sites.map(() => []);
++    docs.forEach((doc, i) => doc.subscribeLocalUpdates((u) => outbox[i].push(u)));
++
++    for (let step = 0; step < 300; step++) {
++      const i = Math.floor(random() * docs.length);
++      const doc = docs[i];
++      const roll = random();
++      if (roll < 0.55 || doc.length === 0) {
++        const at = Math.floor(random() * (doc.length + 1));
++        const ch = String.fromCharCode(97 + Math.floor(random() * 26));
++        doc.insert(at, random() < 0.15 ? ch.repeat(3) : ch);
++      } else if (roll < 0.8) {
++        const at = Math.floor(random() * doc.length);
++        doc.delete(at, 1 + Math.floor(random() * 2));
++      } else {
++        const from = Math.floor(random() * (doc.length + 1));
++        const to = Math.min(doc.length, from + Math.floor(random() * 3));
++        doc.replaceRange(from, to, 'R');
++      }
++    }
++
++    // Deliver everything to everyone, in a per-receiver shuffled sender order.
++    for (let r = 0; r < docs.length; r++) {
++      const order = [...outbox.keys()].filter((s) => s !== r);
++      if (random() < 0.5) order.reverse();
++      for (const s of order) {
++        for (const update of outbox[s]) docs[r].import(update);
++      }
++    }
++
++    assert.equal(docs[0].getText(), docs[1].getText(), `seed ${seed}`);
++    assert.equal(docs[1].getText(), docs[2].getText(), `seed ${seed}`);
++  }
++});
++
++/* ------------------------------------------------------ snapshots / wire */
++
++test('setText → snapshot → import on a fresh doc reproduces the string', () => {
++  const a = new EsbtDoc();
++  a.setText('# Title\n\nBody with **bold** and \u00e9\u5b57🎈.');
++  const snapshot = a.export({ mode: 'snapshot' });
++  const b = new EsbtDoc();
++  b.import(snapshot);
++  assert.equal(b.getText(), a.getText());
++
++  // Idempotent: importing the same payload again changes nothing.
++  b.import(snapshot);
++  assert.equal(b.getText(), a.getText());
++});
++
++test('an update from an empty version vector reproduces the snapshot text', () => {
++  const a = new EsbtDoc();
++  a.setText('replay me');
++  const b = new EsbtDoc();
++  b.import(a.export({ mode: 'update' }));
++  assert.equal(b.getText(), 'replay me');
++});
++
++test('fork: snapshot → two docs → edits each → exchange updates → equal text', () => {
++  const origin = new EsbtDoc({ siteId: 'origin' });
++  origin.setText('The quick brown fox jumps over the lazy dog.');
++  const snapshot = origin.export({ mode: 'snapshot' });
++
++  const a = new EsbtDoc({ siteId: 'fork-a' });
++  const b = new EsbtDoc({ siteId: 'fork-b' });
++  a.import(snapshot);
++  b.import(snapshot);
++
++  for (let i = 0; i < 20; i++) {
++    a.insert(Math.min(a.length, 4 + i), 'A');
++    b.insert(Math.min(b.length, 10 + i), 'B');
++    if (i % 3 === 0) {
++      a.delete(0, 1);
++      b.delete(b.length - 1, 1);
++    }
++  }
++
++  const forA = b.export({ mode: 'update', from: a.oplogVersion() });
++  const forB = a.export({ mode: 'update', from: b.oplogVersion() });
++  a.import(forA);
++  b.import(forB);
++  assert.equal(a.getText(), b.getText());
++});
++
++test('import merges a snapshot — newer local ops are never clobbered', () => {
++  const server = new EsbtDoc({ siteId: 'server' });
++  server.setText('server state');
++  const snapshot = server.export({ mode: 'snapshot' });
++
++  const client = new EsbtDoc({ siteId: 'client' });
++  client.import(snapshot);
++  client.insert(client.length, ' + local tail'); // ops the snapshot has never seen
++  client.import(snapshot); // e.g. a stale HTTP response arriving late
++  assert.equal(client.getText(), 'server state + local tail');
++});
++
++test('shallow snapshot paints the text without an oplog and still merges', () => {
++  const server = new EsbtDoc({ siteId: 'server' });
++  server.setText('cold open body');
++  const shallow = server.export({ mode: 'shallow-snapshot' });
++  const full = server.export({ mode: 'snapshot' });
++  assert.ok(shallow.byteLength < full.byteLength);
++
++  const client = new EsbtDoc({ siteId: 'client' });
++  client.import(shallow);
++  assert.equal(client.getText(), 'cold open body');
++
++  // The shallow copy can not serve history it does not hold…
++  const replay = client.export({ mode: 'update' });
++  const fresh = new EsbtDoc();
++  fresh.import(replay);
++  assert.equal(fresh.getText(), '');
++
++  // …but it edits and syncs normally from here on.
++  client.insert(client.length, '!');
++  server.import(client.export({ mode: 'update', from: server.oplogVersion() }));
++  assert.equal(server.getText(), 'cold open body!');
++});
++
++test('a delete the exporter still had buffered stays buffered through a snapshot', () => {
++  const a = new EsbtDoc({ siteId: 'a' });
++  const b = new EsbtDoc({ siteId: 'b' });
++
++  const updates: Uint8Array[] = [];
++  const stop = a.subscribeLocalUpdates((u) => updates.push(u));
++  a.insert(0, 'Z');
++  a.delete(0, 1);
++  stop();
++
++  // B receives only the delete: it waits for its insert.
++  b.import(updates[1]);
++  // A third replica bootstraps from B's full snapshot while that delete is pending.
++  const c = new EsbtDoc({ siteId: 'c' });
++  c.import(b.export({ mode: 'snapshot' }));
++
++  // The insert finally reaches both: the buffered delete must fire on each.
++  b.import(updates[0]);
++  c.import(updates[0]);
++  assert.equal(b.getText(), '');
++  assert.equal(c.getText(), '');
++});
++
++test('unknown and corrupt payloads throw; nothing half-applies', () => {
++  const doc = new EsbtDoc();
++  doc.setText('untouched');
++  assert.throws(() => doc.import(new Uint8Array([0x7f, 1, 2, 3])));
++  assert.throws(() => doc.import(new Uint8Array(0)));
++  const truncated = doc.export({ mode: 'snapshot' }).subarray(0, 5);
++  const fresh = new EsbtDoc();
++  assert.throws(() => fresh.import(truncated));
++  assert.equal(fresh.getText(), '');
++  assert.equal(doc.getText(), 'untouched');
++});
++
++test('version vector: roundtrip, URL-sized, independent of document length', () => {
++  const doc = new EsbtDoc({ siteId: 'main-site' });
++  doc.setText('x'.repeat(50_000));
++  const encoded = doc.oplogVersion().encode();
++  assert.ok(encoded.byteLength < 64, `one busy site encodes to ${encoded.byteLength} bytes`);
++
++  const decoded = VersionVector.decode(encoded);
++  assert.deepEqual([...decoded.next.entries()], [['main-site', 50_000]]);
++
++  // 100 peers with default-generated site ids stay under the 4 KiB URL budget.
++  const many = new Map<string, number>();
++  for (let i = 0; i < 100; i++) many.set(new EsbtDoc().siteId, 1_000_000 + i);
++  const big = new VersionVector(many).encode();
++  assert.ok(big.byteLength < 4_096, `100 peers encode to ${big.byteLength} bytes`);
++
++  assert.throws(() => VersionVector.decode(doc.export({ mode: 'snapshot' })));
++});
++
++test('a rehydrated server site resumes its counters — no (site, seq) reuse', () => {
++  const first = new EsbtDoc({ siteId: 'stable-server' });
++  first.setText('persisted');
++  const stored = first.export({ mode: 'snapshot' });
++
++  // Same stable site id, new process.
++  const second = new EsbtDoc({ siteId: 'stable-server' });
++  second.import(stored);
++  second.insert(second.length, ' + after restart');
++
++  // A client that followed the first life keeps following the second.
++  const client = new EsbtDoc({ siteId: 'client' });
++  client.import(stored);
++  client.import(second.export({ mode: 'update', from: client.oplogVersion() }));
++  assert.equal(client.getText(), 'persisted + after restart');
++});
++
++/* ------------------------------------------------------------ reuse rule */
++
++test('reinsertion at a released weight uses a fresh counter (Scenario 3)', () => {
++  const a = new EsbtDoc({ siteId: 'a' });
++  const b = new EsbtDoc({ siteId: 'b' });
++
++  const updates: Uint8Array[] = [];
++  const stop = a.subscribeLocalUpdates((u) => updates.push(u));
++  a.insert(0, 'A'); // ins (w, c1)
++  a.delete(0, 1); //  del (w, c1)
++  a.insert(0, 'B'); // likely reuses w with c2
++  stop();
++
++  // Worst-case order: the reuse insert, then the old delete, then the old insert.
++  b.import(updates[2]);
++  b.import(updates[1]);
++  b.import(updates[0]);
++  assert.equal(a.getText(), 'B');
++  assert.equal(b.getText(), 'B');
++});
++
++/* ------------------------------------------------------------- events */
++
++test('events carry origin and fresh text; imports fire with undefined origin', () => {
++  const doc = new EsbtDoc();
++  const seen: Array<{ origin: string | undefined; text: string }> = [];
++  doc.subscribe((event) => seen.push({ origin: event.origin, text: event.text }));
++
++  doc.transact(() => {
++    doc.insert(0, 'ab');
++    doc.transact(() => doc.delete(0, 1)); // nested joins the outer transact
++  }, 'editor');
++  assert.equal(seen.length, 1);
++  assert.deepEqual(seen[0], { origin: 'editor', text: 'b' });
++
++  const other = new EsbtDoc();
++  other.setText('remote');
++  doc.import(other.export({ mode: 'update' }));
++  assert.equal(seen.length, 2);
++  assert.equal(seen[1].origin, undefined);
++  assert.equal(seen[1].text, doc.getText());
++
++  // Re-importing the same payload is a no-op and fires nothing.
++  doc.import(other.export({ mode: 'update' }));
++  assert.equal(seen.length, 2);
++});
++
++test('subscribeLocalUpdates fires once per outermost transact, never for imports', () => {
++  const doc = new EsbtDoc();
++  const updates: Uint8Array[] = [];
++  doc.subscribeLocalUpdates((u) => updates.push(u));
++
++  doc.transact(() => {
++    doc.insert(0, 'one ');
++    doc.insert(4, 'two');
++  }, 'editor');
++  assert.equal(updates.length, 1);
++
++  const other = new EsbtDoc();
++  other.setText('imported');
++  doc.import(other.export({ mode: 'update' }));
++  assert.equal(updates.length, 1);
++
++  // The single batched payload applies atomically on a peer.
++  const peer = new EsbtDoc();
++  peer.import(updates[0]);
++  assert.equal(peer.getText(), 'one two');
++});
++
++/* --------------------------------------------------------------- undo */
++
++test('undo on A removes A’s text and leaves B’s concurrent text', () => {
++  const a = new EsbtDoc({ siteId: 'a' });
++  const b = new EsbtDoc({ siteId: 'b' });
++  const undo = new UndoManager(a);
++  const ua = wire(a, b);
++  const ub = wire(b, a);
++
++  a.transact(() => a.insert(0, 'from A. '), 'editor');
++  b.transact(() => b.insert(b.length, 'from B.'), 'editor');
++  assert.equal(a.getText(), b.getText());
++
++  assert.ok(undo.canUndo());
++  undo.undo();
++  assert.equal(a.getText(), 'from B.');
++  assert.equal(b.getText(), 'from B.'); // undo emitted new ops; peers converge
++
++  assert.ok(undo.canRedo());
++  undo.redo();
++  assert.equal(a.getText(), 'from A. from B.');
++  assert.equal(b.getText(), a.getText());
++
++  ua();
++  ub();
++  undo.destroy();
++});
++
++test('undo skips steps a collaborator already deleted', () => {
++  const a = new EsbtDoc({ siteId: 'a' });
++  const b = new EsbtDoc({ siteId: 'b' });
++  const undo = new UndoManager(a);
++  const ua = wire(a, b);
++  const ub = wire(b, a);
++
++  a.transact(() => a.insert(0, 'first '), 'editor');
++  a.transact(() => a.insert(6, 'second'), 'editor');
++  b.delete(6, 6); // B removes "second" entirely
++
++  // Undoing must not resurrect it, and must fall through to undo "first ".
++  undo.undo();
++  assert.equal(a.getText(), '');
++  assert.equal(b.getText(), '');
++  ua();
++  ub();
++  undo.destroy();
++});
++
++test('undo grouping: transacts inside mergeIntervalMs form one step', () => {
++  const doc = new EsbtDoc();
++  const undo = new UndoManager(doc, { mergeIntervalMs: 60_000 });
++  for (const ch of 'burst') doc.transact(() => doc.insert(doc.length, ch), 'editor');
++  undo.undo();
++  assert.equal(doc.getText(), '');
++  undo.redo();
++  assert.equal(doc.getText(), 'burst');
++  undo.destroy();
++
++  const strict = new EsbtDoc();
++  const strictUndo = new UndoManager(strict); // contract default: one transact = one step
++  for (const ch of 'ab') strict.transact(() => strict.insert(strict.length, ch), 'editor');
++  strictUndo.undo();
++  assert.equal(strict.getText(), 'a');
++  strictUndo.destroy();
++});
++
++test('imports never enter the undo stack', () => {
++  const a = new EsbtDoc({ siteId: 'a' });
++  const undo = new UndoManager(a);
++  const other = new EsbtDoc({ siteId: 'b' });
++  other.setText('remote text');
++  a.import(other.export({ mode: 'update' }));
++  assert.equal(undo.canUndo(), false);
++  undo.undo(); // must be a harmless no-op
++  assert.equal(a.getText(), 'remote text');
++  undo.destroy();
++});
++
++/* ----------------------------------------------------- headless writes */
++
++test('replaceRange with no editor attached still updates getText() and syncs', () => {
++  const a = new EsbtDoc({ siteId: 'a' });
++  const b = new EsbtDoc({ siteId: 'b' });
++  const ua = wire(a, b);
++  a.setText('- [ ] task');
++  a.replaceRange(3, 4, 'x'); // the preview checkbox path
++  assert.equal(a.getText(), '- [x] task');
++  ua();
++  assert.equal(b.getText(), '- [x] task');
++});
++
++/* ------------------------------------------------------------- anchors */
++
++test('anchors stay attached through concurrent edits; deleted anchors collapse', () => {
++  const doc = new EsbtDoc();
++  doc.setText('abcdef');
++  const anchor = doc.indexToAnchor(3); // 'd'
++  doc.insert(0, '>>> ');
++  assert.equal(doc.anchorToIndex(anchor), 7);
++  assert.equal(doc.getText()[doc.anchorToIndex(anchor)], 'd');
++
++  doc.delete(7, 1); // delete 'd' itself
++  const collapsed = doc.anchorToIndex(anchor);
++  assert.equal(doc.getText()[collapsed], 'e');
++
++  const end = doc.indexToAnchor(doc.length);
++  doc.insert(doc.length, '!');
++  assert.equal(doc.anchorToIndex(end), doc.length);
++});
++
++/* ------------------------------------------------------------ presence */
++
++test('EphemeralStore: set/get/keys/getAllStates, apply merges, encodeAll roundtrips', () => {
++  const a = new EphemeralStore(30_000);
++  const b = new EphemeralStore(30_000);
++
++  const frames: Uint8Array[] = [];
++  a.subscribeLocalUpdates((bytes) => frames.push(bytes));
++
++  a.set('site-a-cm-user', { name: 'Swift Otter', colorClassName: 'marks-user3' });
++  a.set('site-a-cm-sel', { from: 2, to: 7 });
++  assert.equal(frames.length, 2);
++  assert.deepEqual(a.keys().sort(), ['site-a-cm-sel', 'site-a-cm-user']);
++
++  let notified = 0;
++  b.subscribe(() => (notified += 1));
++  for (const frame of frames) b.apply(frame);
++  assert.ok(notified > 0);
++  assert.deepEqual(b.get('site-a-cm-sel'), { from: 2, to: 7 });
++
++  const c = new EphemeralStore(30_000);
++  c.apply(b.encodeAll());
++  assert.deepEqual(c.getAllStates(), b.getAllStates());
++
++  // Applying a remote frame must not re-emit it as a local update.
++  const before = frames.length;
++  a.apply(b.encodeAll());
++  assert.equal(frames.length, before);
++
++  // Deletion gossips as a tombstone.
++  a.delete('site-a-cm-sel');
++  b.apply(frames[frames.length - 1]);
++  assert.equal(b.get('site-a-cm-sel'), undefined);
++
++  assert.throws(() => a.apply(new Uint8Array([9, 9, 9])));
++
++  a.destroy();
++  b.destroy();
++  c.destroy();
++});
++
++test('EphemeralStore: entries expire after ttlMs and subscribers hear about it', async () => {
++  const store = new EphemeralStore(600);
++  let notified = 0;
++  store.subscribe(() => (notified += 1));
++  store.set('k', 'v');
++  assert.equal(store.get('k'), 'v');
++  const seen = notified;
++  await new Promise((resolve) => setTimeout(resolve, 1_400));
++  assert.equal(store.get('k'), undefined);
++  assert.deepEqual(store.getAllStates(), {});
++  assert.ok(notified > seen, 'expiry must notify so cursors disappear');
++  store.destroy();
++});
++
++/* ----------------------------------------------------- degenerate gaps */
++
++test('inserting between concurrent same-gap twins never drops or misplaces beyond the pair', () => {
++  // A and B insert into the same empty gap concurrently: with a flat first
++  // path digit these would be weight twins with no admissible weight between
++  // them. Every replica must still accept an insert aimed at that gap.
++  const a = new EsbtDoc({ siteId: 'aaaa' });
++  const b = new EsbtDoc({ siteId: 'bbbb' });
++  const fromA: Uint8Array[] = [];
++  const fromB: Uint8Array[] = [];
++  a.subscribeLocalUpdates((u) => fromA.push(u));
++  b.subscribeLocalUpdates((u) => fromB.push(u));
++  a.insert(0, 'x');
++  b.insert(0, 'y');
++  for (const u of fromB) a.import(u);
++  for (const u of fromA) b.import(u);
++  assert.equal(a.getText(), b.getText());
++  assert.equal(a.length, 2);
++
++  // Type between the two concurrent units, from both sites.
++  a.insert(1, 'M');
++  assert.equal(a.length, 3, 'insert into the contested gap must not be dropped');
++  b.insert(1, 'N');
++  const more: Uint8Array[] = [];
++  const stop = a.subscribeLocalUpdates((u) => more.push(u));
++  stop();
++  for (const u of fromB.slice(1)) a.import(u);
++  for (const u of fromA.slice(1)) b.import(u);
++  assert.equal(a.getText(), b.getText());
++  assert.equal(a.length, 4);
++});
++
++test('deep same-site midpoint typing never drops units', () => {
++  const doc = new EsbtDoc();
++  for (let i = 0; i < 5_000; i++) doc.insert(Math.floor(i / 2), 'x');
++  assert.equal(doc.length, 5_000);
++
++  // And the result replays identically on a peer.
++  const peer = new EsbtDoc();
++  peer.import(doc.export({ mode: 'update' }));
++  assert.equal(peer.getText(), doc.getText());
++});
++
++/* ---------------------------------------------------------- performance */
++
++test('getText() is cheap enough to call on every change', () => {
++  const doc = new EsbtDoc();
++  const start = performance.now();
++  for (let i = 0; i < 5_000; i++) {
++    doc.insert(Math.floor(i / 2), 'x');
++    doc.getText();
++  }
++  const elapsed = performance.now() - start;
++  assert.ok(elapsed < 5_000, `5k mid-document edits with reads took ${elapsed.toFixed(0)}ms`);
++  assert.equal(doc.length, 5_000);
++});
+diff --git a/esbt/src/doc.ts b/esbt/src/doc.ts
+new file mode 100644
+index 0000000..b40ef98
+--- /dev/null
++++ b/esbt/src/doc.ts
+@@ -0,0 +1,590 @@
++/**
++ * EsbtDoc — the sequence document (Algorithm 3 plus the editor surface the
++ * marks contract names): UTF-16 index edits, origin-tagged transactions,
++ * snapshot / shallow-snapshot / update export, merging import, version
++ * vectors, and the internal hooks the per-peer UndoManager drives.
++ *
++ * Concurrency rules (paper §5–6), all enforced here:
++ *   1. Insertions are always ready; they commute by weight order.
++ *   2. A delete applies only once its matching insert (ω, c) is present;
++ *      until then it waits in the pending queue.
++ *   3. A delete for an already-deleted (ω, c) is ignored via the delete log.
++ *   4. Reinsertion at a released weight uses a fresh c; c never affects order.
++ *   5. Same integrated op set ⇒ identical getText(), any delivery order.
++ */
++
++import type { EsbtAnchor, EsbtConfig, EsbtEvent, EsbtExportOptions } from './api.js';
++import { decodePayload, encodeSnapshot, encodeUpdate, type SnapshotPayload } from './encode.js';
++import { DeleteLog, PendingQueue, type Op } from './ops.js';
++import { DocSeq, type Item } from './tree.js';
++import { VersionVector } from './vector.js';
++import {
++  Allocator,
++  SENTINEL_SITE,
++  isEnd,
++  parseWeightKey,
++  type SiteId,
++  type Weight,
++  weightBegin,
++  weightEnd,
++  weightKey,
++} from './weight.js';
++
++const DEFAULT_DMAX = 2 ** 31 - 1;
++const DEFAULT_BASE = 2 ** 16;
++const DEFAULT_DEPTH = 16;
++
++function randomSiteId(): SiteId {
++  // 80 bits, 20 hex chars: unique enough per document, short enough that a
++  // hundred sites' version vector still fits the 4 KiB URL budget.
++  const cryptoObj = globalThis.crypto;
++  if (cryptoObj && typeof cryptoObj.getRandomValues === 'function') {
++    const bytes = cryptoObj.getRandomValues(new Uint8Array(10));
++    return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
++  }
++  return `s${Date.now().toString(36)}${Math.random().toString(36).slice(2, 12)}`;
++}
++
++type UndoHook = (ops: Op[], origin?: string) => void;
++
++export class EsbtDoc {
++  readonly siteId: SiteId;
++
++  private readonly alloc: Allocator;
++  private readonly seq = new DocSeq();
++  private readonly deleteLog = new DeleteLog();
++  private readonly pending = new PendingQueue();
++
++  /** site → max integrated seq (the version vector). */
++  private readonly vv = new Map<SiteId, number>();
++  /** site → seq → op. The oplog version-vector deltas are served from. */
++  private readonly log = new Map<SiteId, Map<number, Op>>();
++  /** site → last insertion counter c that site handed out. */
++  private readonly counters = new Map<SiteId, number>();
++
++  private counter = 0;
++  private localSeq = 0;
++
++  private cachedText = '';
++  private textDirty = false;
++  /** Bumped by every applied insert or delete; detects visible change cheaply. */
++  private mutations = 0;
++
++  private txDepth = 0;
++  private txOrigin: string | undefined;
++  private txOps: Op[] = [];
++  private txTextChanged = false;
++
++  private readonly listeners = new Set<(event: EsbtEvent) => void>();
++  private readonly updateListeners = new Set<(update: Uint8Array) => void>();
++  private undoHook: UndoHook | null = null;
++
++  constructor(config: EsbtConfig = {}) {
++    this.siteId = config.siteId ?? randomSiteId();
++    if (this.siteId === SENTINEL_SITE) {
++      throw new Error('esbt: the empty site id is reserved for sentinels');
++    }
++    this.alloc = new Allocator(
++      config.dMax ?? DEFAULT_DMAX,
++      config.base ?? DEFAULT_BASE,
++      config.depth ?? DEFAULT_DEPTH,
++    );
++  }
++
++  /* ------------------------------------------------------------ reads */
++
++  get length(): number {
++    return this.seq.length;
++  }
++
++  getText(): string {
++    if (this.textDirty) {
++      this.cachedText = this.seq.text();
++      this.textDirty = false;
++    }
++    return this.cachedText;
++  }
++
++  oplogVersion(): VersionVector {
++    return new VersionVector(new Map(this.vv));
++  }
++
++  /* ------------------------------------------------------- transactions */
++
++  transact(fn: () => void, origin?: string): void {
++    if (this.txDepth === 0) {
++      this.txOrigin = origin;
++      this.txOps = [];
++      this.txTextChanged = false;
++    }
++    this.txDepth += 1;
++    try {
++      fn();
++    } finally {
++      this.txDepth -= 1;
++      if (this.txDepth === 0) this.finishTransact();
++    }
++  }
++
++  private finishTransact(): void {
++    const ops = this.txOps;
++    const origin = this.txOrigin;
++    const textChanged = this.txTextChanged;
++    this.txOps = [];
++    this.txOrigin = undefined;
++    this.txTextChanged = false;
++
++    if (ops.length === 0 && !textChanged) return;
++
++    if (ops.length > 0) {
++      this.undoHook?.(ops, origin);
++      // Local-first: the state is already applied; now emit the bytes.
++      const update = encodeUpdate(ops);
++      for (const listener of this.updateListeners) listener(update);
++    }
++    this.emitEvent(origin);
++  }
++
++  private emitEvent(origin: string | undefined): void {
++    if (this.listeners.size === 0) return;
++    const text = this.getText();
++    const event: EsbtEvent = origin === undefined ? { text } : { origin, text };
++    for (const listener of this.listeners) listener(event);
++  }
++
++  /* ------------------------------------------------------- local edits */
++
++  insert(index: number, text: string): void {
++    this.transact(() => this.insertNow(index, text));
++  }
++
++  delete(index: number, length: number): void {
++    this.transact(() => this.deleteNow(index, length));
++  }
++
++  replaceRange(from: number, to: number, insert: string): void {
++    this.transact(() => {
++      const start = clamp(from, 0, this.seq.length);
++      const end = clamp(to, start, this.seq.length);
++      this.deleteNow(start, end - start);
++      this.insertNow(start, insert);
++    });
++  }
++
++  setText(text: string): void {
++    this.transact(() => {
++      this.deleteNow(0, this.seq.length);
++      this.insertNow(0, text);
++    });
++  }
++
++  private insertNow(index: number, text: string): void {
++    if (text.length === 0) return;
++    const start = clamp(index, 0, this.seq.length);
++    for (let k = 0; k < text.length; k++) {
++      this.insertUnit(start + k, text.charCodeAt(k));
++    }
++  }
++
++  private insertUnit(index: number, unit: number): void {
++    const left = index === 0 ? weightBegin() : this.seq.at(index - 1)!.weight;
++    // A twin pinch (neighbours differing only by site, see Allocator) leaves
++    // no admissible weight in the gap; widen it rightward until one exists.
++    // A widened mint may coincide with a skipped item, so occupancy is
++    // checked before committing. At the END sentinel the ladder advances the
++    // tracker on every attempt, so this terminates.
++    let rightIndex = index;
++    for (let attempts = 0; attempts < 4096; attempts++) {
++      const right =
++        rightIndex >= this.seq.length ? weightEnd() : this.seq.at(rightIndex)!.weight;
++      const w = this.alloc.createWeight(left, right, this.siteId);
++      if (w && !this.seq.has(w)) {
++        this.insertAtWeight(w, unit);
++        return;
++      }
++      if (rightIndex < this.seq.length) rightIndex += 1;
++    }
++    throw new Error('esbt: could not allocate a weight (exhausted retries)');
++  }
++
++  private insertAtWeight(w: Weight, unit: number): Op {
++    this.counter += 1;
++    this.counters.set(this.siteId, this.counter);
++    const op: Op = {
++      kind: 'ins',
++      site: this.siteId,
++      seq: this.stamp(),
++      weight: w,
++      counter: this.counter,
++      unit,
++    };
++    this.logAdd(op);
++    this.applyIns(op);
++    this.txOps.push(op);
++    return op;
++  }
++
++  private deleteNow(index: number, length: number): void {
++    const start = clamp(index, 0, this.seq.length);
++    const count = clamp(length, 0, this.seq.length - start);
++    for (let k = 0; k < count; k++) {
++      const item = this.seq.at(start);
++      if (!item) break;
++      this.deleteItem(item);
++    }
++  }
++
++  private deleteItem(item: Item): Op {
++    const op: Op = {
++      kind: 'del',
++      site: this.siteId,
++      seq: this.stamp(),
++      weight: item.weight,
++      counter: item.counter,
++      // Kept locally (never wired) so undo can reinsert the unit.
++      unit: item.unit,
++    };
++    this.deleteLog.add(item.weight, item.counter);
++    this.logAdd(op);
++    this.applyDel(item.weight);
++    this.txOps.push(op);
++    return op;
++  }
++
++  private stamp(): number {
++    this.localSeq += 1;
++    this.vvNote(this.siteId, this.localSeq);
++    return this.localSeq;
++  }
++
++  /* --------------------------------------------------------- application */
++
++  private applyIns(op: Op): boolean {
++    if (this.deleteLog.has(op.weight, op.counter)) return false;
++    const index = this.seq.insert({ weight: op.weight, unit: op.unit ?? 0, counter: op.counter });
++    if (index < 0) return false;
++    if (!this.textDirty) {
++      this.cachedText =
++        this.cachedText.slice(0, index) +
++        String.fromCharCode(op.unit ?? 0) +
++        this.cachedText.slice(index);
++    }
++    this.mutations += 1;
++    this.txTextChanged = true;
++    return true;
++  }
++
++  private applyDel(w: Weight): boolean {
++    const removed = this.seq.delete(w);
++    if (!removed) return false;
++    if (!this.textDirty) {
++      this.cachedText =
++        this.cachedText.slice(0, removed.index) + this.cachedText.slice(removed.index + 1);
++    }
++    this.mutations += 1;
++    this.txTextChanged = true;
++    return true;
++  }
++
++  /* ------------------------------------------------------------- remote */
++
++  /**
++   * Integrate one remote op. Returns whether the visible state may have
++   * changed. Duplicates — by oplog entry or by version vector — are no-ops.
++   */
++  private receive(op: Op): boolean {
++    if (this.logHas(op.site, op.seq)) return false;
++    if ((this.vv.get(op.site) ?? 0) >= op.seq) return false;
++
++    this.logAdd(op);
++    this.vvNote(op.site, op.seq);
++    if (op.kind === 'ins') {
++      const seen = this.counters.get(op.site) ?? 0;
++      if (op.counter > seen) this.counters.set(op.site, op.counter);
++    }
++    // Ops that claim this replica's own site can only arrive when a stable
++    // site id was rehydrated; keep the generators ahead of them.
++    if (op.site === this.siteId) {
++      this.localSeq = Math.max(this.localSeq, op.seq);
++      if (op.kind === 'ins') this.counter = Math.max(this.counter, op.counter);
++    }
++
++    const before = this.mutations;
++    this.pending.push(op);
++    this.drainPending();
++    return this.mutations !== before;
++  }
++
++  private drainPending(): void {
++    this.pending.drain((op) => this.step(op));
++  }
++
++  /** One attempt at a buffered op. True = consumed (applied or discarded). */
++  private step(op: Op): boolean {
++    if (op.kind === 'ins') {
++      this.applyIns(op);
++      return true; // insertions are always ready; duplicates are discarded
++    }
++    // Deletes: idempotence first (Scenario 2).
++    if (this.deleteLog.has(op.weight, op.counter)) return true;
++    const live = this.seq.find(op.weight);
++    if (live && live.counter === op.counter) {
++      this.deleteLog.add(op.weight, op.counter);
++      this.applyDel(op.weight);
++      return true;
++    }
++    if (live && live.counter !== op.counter) {
++      // The weight was released and reused (Scenario 3): this delete names
++      // the older occupancy, which is already gone.
++      this.deleteLog.add(op.weight, op.counter);
++      return true;
++    }
++    return false; // insert not seen yet — stay buffered
++  }
++
++  /* ------------------------------------------------------ export/import */
++
++  export(options: EsbtExportOptions): Uint8Array {
++    switch (options.mode) {
++      case 'snapshot':
++        return encodeSnapshot(
++          {
++            items: this.seq.atoms(),
++            deleteLog: this.deleteLog.values(),
++            version: new Map(this.vv),
++            counters: new Map(this.counters),
++            ops: this.allOps(),
++          },
++          false,
++        );
++      case 'shallow-snapshot':
++        return encodeSnapshot(
++          {
++            items: this.seq.atoms(),
++            deleteLog: [],
++            version: new Map(this.vv),
++            counters: new Map(this.counters),
++            ops: [],
++          },
++          true,
++        );
++      case 'update': {
++        const from = this.versionMap(options.from);
++        const ops: Op[] = [];
++        for (const site of [...this.log.keys()].sort()) {
++          const bySeq = this.log.get(site)!;
++          const start = (from.get(site) ?? 0) + 1;
++          const end = this.vv.get(site) ?? 0;
++          for (let seq = start; seq <= end; seq++) {
++            const op = bySeq.get(seq);
++            if (op) ops.push(op);
++          }
++        }
++        return encodeUpdate(ops);
++      }
++      default:
++        throw new Error('esbt: unknown export mode');
++    }
++  }
++
++  private versionMap(from: { encode(): Uint8Array } | undefined): Map<SiteId, number> {
++    if (!from) return new Map();
++    if (from instanceof VersionVector) return from.next;
++    // A foreign object satisfying the interface: round-trip the encoding.
++    return VersionVector.decode(from.encode()).next;
++  }
++
++  private allOps(): Op[] {
++    const ops: Op[] = [];
++    for (const site of [...this.log.keys()].sort()) {
++      const bySeq = this.log.get(site)!;
++      for (const seq of [...bySeq.keys()].sort((a, b) => a - b)) {
++        ops.push(bySeq.get(seq)!);
++      }
++    }
++    return ops;
++  }
++
++  import(bytes: Uint8Array): void {
++    const payload = decodePayload(bytes);
++    let changed = false;
++
++    // Splicing the cached string per op is ideal for keystrokes and
++    // quadratic for bulk payloads; large imports rebuild the text once.
++    const bulk = payload.kind === 'update' ? payload.ops.length : payload.items.length;
++    if (bulk > 64) this.textDirty = true;
++
++    if (payload.kind === 'update') {
++      for (const op of payload.ops) {
++        if (this.receive(op)) changed = true;
++      }
++    } else {
++      changed = this.mergeSnapshot(payload);
++    }
++
++    if (changed) this.emitEvent(undefined);
++  }
++
++  /**
++   * Merge — never install. Everything this replica knows that the payload
++   * does not survives; everything the payload knows that this replica does
++   * not is integrated.
++   */
++  private mergeSnapshot(payload: SnapshotPayload): boolean {
++    const before = this.mutations;
++
++    // 1. Deletions the payload has applied.
++    for (const entry of payload.deleteLog) {
++      if (this.deleteLog.has(entry.weight, entry.counter)) continue;
++      this.deleteLog.add(entry.weight, entry.counter);
++      const live = this.seq.find(entry.weight);
++      if (live && live.counter === entry.counter) {
++        this.applyDel(entry.weight);
++      }
++    }
++
++    // 2. Live items.
++    for (const item of payload.items) {
++      if (this.deleteLog.has(item.weight, item.counter)) continue;
++      if (this.seq.has(item.weight)) continue; // same occupancy, or ours is the newer reuse
++      const index = this.seq.insert(item);
++      if (index >= 0) {
++        if (!this.textDirty) {
++          this.cachedText =
++            this.cachedText.slice(0, index) +
++            String.fromCharCode(item.unit) +
++            this.cachedText.slice(index);
++        }
++        this.mutations += 1;
++      }
++    }
++
++    // 3. Clocks.
++    for (const [site, seq] of payload.version) this.vvNote(site, seq);
++    for (const [site, c] of payload.counters) {
++      const seen = this.counters.get(site) ?? 0;
++      if (c > seen) this.counters.set(site, c);
++    }
++
++    // 4. Oplog union, replaying only ops whose effect is not yet visible —
++    //    a delete the exporter itself still had buffered must keep waiting
++    //    here too, not get silently marked as integrated.
++    for (const op of payload.ops) {
++      if (this.logHas(op.site, op.seq)) continue;
++      this.logAdd(op);
++      const applied =
++        op.kind === 'ins'
++          ? this.deleteLog.has(op.weight, op.counter) || this.seq.has(op.weight)
++          : this.deleteLog.has(op.weight, op.counter);
++      if (!applied) this.pending.push(op);
++    }
++
++    // 5. Resume this site's generators if the payload knows about us.
++    this.localSeq = Math.max(this.localSeq, this.vv.get(this.siteId) ?? 0);
++    this.counter = Math.max(this.counter, this.counters.get(this.siteId) ?? 0);
++
++    this.drainPending();
++    return this.mutations !== before;
++  }
++
++  private logHas(site: SiteId, seq: number): boolean {
++    return this.log.get(site)?.has(seq) ?? false;
++  }
++
++  private logAdd(op: Op): void {
++    let bySeq = this.log.get(op.site);
++    if (!bySeq) {
++      bySeq = new Map();
++      this.log.set(op.site, bySeq);
++    }
++    bySeq.set(op.seq, op);
++  }
++
++  private vvNote(site: SiteId, seq: number): void {
++    const seen = this.vv.get(site) ?? 0;
++    if (seq > seen) this.vv.set(site, seq);
++  }
++
++  /* ------------------------------------------------------ subscriptions */
++
++  subscribe(listener: (event: EsbtEvent) => void): () => void {
++    this.listeners.add(listener);
++    return () => this.listeners.delete(listener);
++  }
++
++  subscribeLocalUpdates(listener: (update: Uint8Array) => void): () => void {
++    this.updateListeners.add(listener);
++    return () => this.updateListeners.delete(listener);
++  }
++
++  /* ------------------------------------------------------------ anchors */
++
++  /**
++   * Weight-stable anchor for the item at `index` (the END sentinel when the
++   * index is at or past the end). Anchors survive concurrent edits anywhere
++   * else in the document, which UTF-16 indices do not.
++   */
++  indexToAnchor(index: number): EsbtAnchor {
++    const at = clamp(index, 0, this.seq.length);
++    if (at >= this.seq.length) return { weight: weightKey(weightEnd()), offset: 0 };
++    return { weight: weightKey(this.seq.at(at)!.weight), offset: 0 };
++  }
++
++  /**
++   * Current index of an anchor. A deleted anchor resolves to where its item
++   * would sit today (the lower bound of its weight), so ranges collapse
++   * instead of drifting.
++   */
++  anchorToIndex(anchor: EsbtAnchor): number {
++    const w = parseWeightKey(anchor.weight);
++    if (isEnd(w.f) && w.site === SENTINEL_SITE) return this.seq.length;
++    const exact = this.seq.indexOfWeight(w);
++    const base = exact >= 0 ? exact : this.seq.lowerBound(w);
++    return clamp(base + Math.max(0, Math.floor(anchor.offset)), 0, this.seq.length);
++  }
++
++  /* ---------------------------------------------------- undo internals */
++
++  /** @internal Wired by UndoManager; receives each local transact's ops. */
++  _setUndoHook(hook: UndoHook | null): void {
++    this.undoHook = hook;
++  }
++
++  /**
++   * @internal Apply an undo/redo batch by generating *new* ops (paper rule:
++   * reused weights get a fresh c), returning the inverse batch for the
++   * opposite stack. Ops whose target a collaborator already removed are
++   * skipped — undo never reverts anyone else's work.
++   */
++  _applyUndoOps(batch: Op[], origin: 'undo' | 'redo'): Op[] {
++    const inverse: Op[] = [];
++    this.transact(() => {
++      for (const op of batch) {
++        if (op.kind === 'ins') {
++          const live = this.seq.find(op.weight);
++          if (!live || live.counter !== op.counter) continue;
++          inverse.push(this.deleteItem(live));
++        } else {
++          if (op.unit === undefined) continue;
++          if (this.seq.has(op.weight)) continue;
++          if (this.deleteLog.has(op.weight, op.counter)) {
++            // Reinsert the released weight under a fresh counter; document
++            // order is unchanged because c does not participate in order.
++            inverse.push(this.insertAtWeightReusing(op.weight, op.unit));
++          }
++        }
++      }
++    }, origin);
++    return inverse;
++  }
++
++  private insertAtWeightReusing(w: Weight, unit: number): Op {
++    return this.insertAtWeight(w, unit);
++  }
++}
++
++function clamp(value: number, lo: number, hi: number): number {
++  const v = Math.floor(value);
++  if (Number.isNaN(v)) return lo;
++  return v < lo ? lo : v > hi ? hi : v;
++}
+diff --git a/esbt/src/encode.ts b/esbt/src/encode.ts
+new file mode 100644
+index 0000000..4d032fe
+--- /dev/null
++++ b/esbt/src/encode.ts
+@@ -0,0 +1,198 @@
++/**
++ * Payload formats: snapshot / shallow-snapshot / update.
++ *
++ * One byte of type tag, then a site table, then sections. A single
++ * `EsbtDoc.import` accepts all three (plus an encoded version vector is its
++ * own tagged payload, see `vector.ts`). Unknown tags throw — corrupt bytes
++ * must never half-apply.
++ */
++
++import { Reader, TAG_SHALLOW, TAG_SNAPSHOT, TAG_UPDATE, Writer } from './codec.js';
++import type { Item } from './tree.js';
++import {
++  type Op,
++  SiteTable,
++  readOp,
++  readWeight,
++  writeOp,
++  writeWeight,
++} from './ops.js';
++import { weight as weightOf, type SiteId, type Weight } from './weight.js';
++
++export interface DeletedEntry {
++  weight: Weight;
++  counter: number;
++}
++
++export interface SnapshotPayload {
++  kind: 'snapshot' | 'shallow-snapshot';
++  /** Live items in document order. */
++  items: Item[];
++  /** Applied deletions (empty in a shallow snapshot). */
++  deleteLog: DeletedEntry[];
++  /** site → max seq integrated when this snapshot was taken. */
++  version: Map<SiteId, number>;
++  /** site → last insertion counter c handed out by that site. */
++  counters: Map<SiteId, number>;
++  /** Full oplog (empty in a shallow snapshot). */
++  ops: Op[];
++}
++
++export interface UpdatePayload {
++  kind: 'update';
++  ops: Op[];
++}
++
++export type Payload = SnapshotPayload | UpdatePayload;
++
++function writeSiteMap(w: Writer, table: SiteTable, map: Map<SiteId, number>): void {
++  const sites = [...map.keys()].sort();
++  w.uint(sites.length);
++  for (const site of sites) {
++    w.uint(table.idOf(site));
++    w.uint(map.get(site) ?? 0);
++  }
++}
++
++function readSiteMap(r: Reader, sites: SiteId[]): Map<SiteId, number> {
++  const count = r.uint();
++  const map = new Map<SiteId, number>();
++  for (let i = 0; i < count; i++) {
++    const siteIdx = r.uint();
++    if (siteIdx >= sites.length) throw new Error('esbt: bad site reference');
++    map.set(sites[siteIdx], r.uint());
++  }
++  return map;
++}
++
++export function encodeSnapshot(payload: Omit<SnapshotPayload, 'kind'>, shallow: boolean): Uint8Array {
++  // The site table must be complete before any section is written, so the
++  // sections are staged into a second writer while the table fills.
++  const table = new SiteTable();
++  const body = new Writer();
++
++  // Items arrive in document (weight) order, so consecutive sequence paths
++  // share long prefixes; encoding only the divergent suffix keeps deep
++  // regions from dominating the payload.
++  body.uint(payload.items.length);
++  let prevSc: readonly number[] = [];
++  for (const item of payload.items) {
++    const w = item.weight;
++    body.int(w.f.p);
++    body.int(w.f.q);
++    body.int(w.sn);
++    let shared = 0;
++    const max = Math.min(prevSc.length, w.sc.length);
++    while (shared < max && prevSc[shared] === w.sc[shared]) shared += 1;
++    body.uint(shared);
++    body.uint(w.sc.length - shared);
++    for (let i = shared; i < w.sc.length; i++) body.uint(w.sc[i]);
++    body.uint(table.idOf(w.site));
++    prevSc = w.sc;
++    body.uint(item.counter);
++    body.uint(item.unit);
++  }
++
++  if (shallow) {
++    body.uint(0); // delete log
++  } else {
++    body.uint(payload.deleteLog.length);
++    for (const entry of payload.deleteLog) {
++      writeWeight(body, table, entry.weight);
++      body.uint(entry.counter);
++    }
++  }
++
++  writeSiteMap(body, table, payload.version);
++  writeSiteMap(body, table, payload.counters);
++
++  if (shallow) {
++    body.uint(0); // oplog
++  } else {
++    body.uint(payload.ops.length);
++    for (const op of payload.ops) writeOp(body, table, op);
++  }
++
++  const out = new Writer();
++  out.u8(shallow ? TAG_SHALLOW : TAG_SNAPSHOT);
++  table.write(out);
++  out.bytes(body.done());
++  return out.done();
++}
++
++export function encodeUpdate(ops: Op[]): Uint8Array {
++  const table = new SiteTable();
++  const body = new Writer();
++  body.uint(ops.length);
++  for (const op of ops) writeOp(body, table, op);
++
++  const out = new Writer();
++  out.u8(TAG_UPDATE);
++  table.write(out);
++  out.bytes(body.done());
++  return out.done();
++}
++
++export function decodePayload(bytes: Uint8Array): Payload {
++  if (bytes.length === 0) throw new Error('esbt: empty payload');
++  const outer = new Reader(bytes);
++  const tag = outer.u8();
++
++  if (tag !== TAG_SNAPSHOT && tag !== TAG_SHALLOW && tag !== TAG_UPDATE) {
++    throw new Error(`esbt: unknown payload tag ${tag}`);
++  }
++
++  const sites = SiteTable.read(outer);
++  const r = new Reader(outer.bytes());
++
++  if (tag === TAG_UPDATE) {
++    const opCount = r.uint();
++    const ops: Op[] = [];
++    for (let i = 0; i < opCount; i++) ops.push(readOp(r, sites));
++    return { kind: 'update', ops };
++  }
++
++  const itemCount = r.uint();
++  const items: Item[] = [];
++  let prevSc: number[] = [];
++  for (let i = 0; i < itemCount; i++) {
++    const p = r.int();
++    const q = r.int();
++    const sn = r.int();
++    const shared = r.uint();
++    if (shared > prevSc.length) throw new Error('esbt: bad sc prefix');
++    const suffixLen = r.uint();
++    const sc = prevSc.slice(0, shared);
++    for (let d = 0; d < suffixLen; d++) sc.push(r.uint());
++    const siteIdx = r.uint();
++    if (siteIdx >= sites.length) throw new Error('esbt: bad site reference');
++    const w = weightOf({ p, q }, sn, sc, sites[siteIdx]);
++    prevSc = sc;
++    const counter = r.uint();
++    const unit = r.uint();
++    items.push({ weight: w, unit, counter });
++  }
++
++  const delCount = r.uint();
++  const deleteLog: DeletedEntry[] = [];
++  for (let i = 0; i < delCount; i++) {
++    const weight = readWeight(r, sites);
++    deleteLog.push({ weight, counter: r.uint() });
++  }
++
++  const version = readSiteMap(r, sites);
++  const counters = readSiteMap(r, sites);
++
++  const opCount = r.uint();
++  const ops: Op[] = [];
++  for (let i = 0; i < opCount; i++) ops.push(readOp(r, sites));
++
++  return {
++    kind: tag === TAG_SHALLOW ? 'shallow-snapshot' : 'snapshot',
++    items,
++    deleteLog,
++    version,
++    counters,
++    ops,
++  };
++}
+diff --git a/esbt/src/ephemeral.ts b/esbt/src/ephemeral.ts
+index 9fa54c6..2f9503c 100644
+--- a/esbt/src/ephemeral.ts
++++ b/esbt/src/ephemeral.ts
+@@ -1,12 +1,20 @@
+ /**
+  * Presence store. Not in the ESBT paper — marks needs it for avatars and
+  * remote cursors. Values are JSON-cloneable. Entries expire after `ttlMs`
+- * without a local or remote refresh.
++ * without a local or remote refresh, and expiry notifies subscribers so a
++ * vanished peer's cursor disappears without any traffic.
++ *
++ * Never persisted, never part of a document snapshot.
+  */
++
++import { Reader, TAG_EPHEMERAL, Writer } from './codec.js';
++
+ export interface EphemeralStore {
+   set(key: string, value: unknown): void;
+   get(key: string): unknown;
+   delete(key: string): void;
++  /** Keys of every live (unexpired) entry. */
++  keys(): string[];
+   getAllStates(): Record<string, unknown>;
+ 
+   /** Encode every live entry. Sent on socket open and on local change. */
+@@ -26,3 +34,177 @@ export interface EphemeralStoreStatic {
+    */
+   new (ttlMs: number): EphemeralStore;
+ }
++
++interface Entry {
++  value: unknown;
++  /** Local clock at the last write or refresh. */
++  at: number;
++  /** True while a removal still needs to be gossiped. */
++  deleted: boolean;
++}
++
++const FLAG_DELETED = 1;
++
++class EphemeralStoreImpl implements EphemeralStore {
++  private readonly ttlMs: number;
++  private readonly entries = new Map<string, Entry>();
++  private readonly listeners = new Set<() => void>();
++  private readonly updateListeners = new Set<(bytes: Uint8Array) => void>();
++  private sweeper: ReturnType<typeof setInterval> | null = null;
++  private destroyed = false;
++
++  constructor(ttlMs: number) {
++    this.ttlMs = Math.max(1, ttlMs);
++    const interval = Math.min(Math.max(500, Math.floor(this.ttlMs / 2)), 5_000);
++    this.sweeper = setInterval(() => this.sweep(), interval);
++    // Node: a presence store must not keep the process alive.
++    (this.sweeper as { unref?: () => void }).unref?.();
++  }
++
++  private live(entry: Entry | undefined, now: number): entry is Entry {
++    return entry !== undefined && !entry.deleted && now - entry.at <= this.ttlMs;
++  }
++
++  private sweep(): void {
++    const now = Date.now();
++    let dropped = false;
++    for (const [key, entry] of this.entries) {
++      if (entry.deleted || now - entry.at > this.ttlMs) {
++        this.entries.delete(key);
++        if (!entry.deleted) dropped = true;
++      }
++    }
++    if (dropped) this.notify();
++  }
++
++  private notify(): void {
++    for (const listener of this.listeners) listener();
++  }
++
++  private emitLocal(keys: string[]): void {
++    if (this.updateListeners.size === 0) return;
++    const bytes = this.encodeKeys(keys);
++    for (const listener of this.updateListeners) listener(bytes);
++  }
++
++  set(key: string, value: unknown): void {
++    if (this.destroyed) return;
++    this.entries.set(key, { value, at: Date.now(), deleted: false });
++    this.emitLocal([key]);
++    this.notify();
++  }
++
++  get(key: string): unknown {
++    const entry = this.entries.get(key);
++    return this.live(entry, Date.now()) ? entry.value : undefined;
++  }
++
++  delete(key: string): void {
++    if (this.destroyed) return;
++    const entry = this.entries.get(key);
++    if (!entry || entry.deleted) return;
++    this.entries.set(key, { value: undefined, at: Date.now(), deleted: true });
++    this.emitLocal([key]);
++    this.notify();
++  }
++
++  keys(): string[] {
++    const now = Date.now();
++    const out: string[] = [];
++    for (const [key, entry] of this.entries) {
++      if (this.live(entry, now)) out.push(key);
++    }
++    return out;
++  }
++
++  getAllStates(): Record<string, unknown> {
++    const now = Date.now();
++    const out: Record<string, unknown> = {};
++    for (const [key, entry] of this.entries) {
++      if (this.live(entry, now)) out[key] = entry.value;
++    }
++    return out;
++  }
++
++  private encodeKeys(keys: string[]): Uint8Array {
++    const now = Date.now();
++    const w = new Writer();
++    w.u8(TAG_EPHEMERAL);
++    w.uint(keys.length);
++    for (const key of keys) {
++      const entry = this.entries.get(key);
++      w.str(key);
++      if (!entry || entry.deleted) {
++        w.u8(FLAG_DELETED);
++        continue;
++      }
++      w.u8(0);
++      // Age instead of a wall-clock timestamp: tolerant of clock skew
++      // between peers, exact enough for a 30-second TTL.
++      w.uint(Math.max(0, now - entry.at));
++      w.str(JSON.stringify(entry.value ?? null));
++    }
++    return w.done();
++  }
++
++  encodeAll(): Uint8Array {
++    return this.encodeKeys(this.keys());
++  }
++
++  apply(bytes: Uint8Array): void {
++    if (this.destroyed || bytes.length === 0) return;
++    const r = new Reader(bytes);
++    const tag = r.u8();
++    if (tag !== TAG_EPHEMERAL) throw new Error(`esbt: not a presence payload (tag ${tag})`);
++
++    const now = Date.now();
++    const count = r.uint();
++    let changed = false;
++
++    for (let i = 0; i < count; i++) {
++      const key = r.str();
++      const flags = r.u8();
++      if (flags & FLAG_DELETED) {
++        const existing = this.entries.get(key);
++        if (existing && !existing.deleted) {
++          this.entries.delete(key);
++          changed = true;
++        }
++        continue;
++      }
++      const age = r.uint();
++      const value = JSON.parse(r.str()) as unknown;
++      if (age > this.ttlMs) continue; // arrived already expired
++      const at = now - age;
++      const existing = this.entries.get(key);
++      if (!existing || at > existing.at || existing.deleted) {
++        this.entries.set(key, { value, at, deleted: false });
++        changed = true;
++      }
++    }
++
++    if (changed) this.notify();
++  }
++
++  subscribe(listener: () => void): () => void {
++    this.listeners.add(listener);
++    return () => this.listeners.delete(listener);
++  }
++
++  subscribeLocalUpdates(listener: (bytes: Uint8Array) => void): () => void {
++    this.updateListeners.add(listener);
++    return () => this.updateListeners.delete(listener);
++  }
++
++  destroy(): void {
++    if (this.destroyed) return;
++    this.destroyed = true;
++    if (this.sweeper !== null) clearInterval(this.sweeper);
++    this.sweeper = null;
++    this.entries.clear();
++    this.listeners.clear();
++    this.updateListeners.clear();
++  }
++}
++
++export const EphemeralStore: EphemeralStoreStatic = EphemeralStoreImpl;
+diff --git a/esbt/src/index.ts b/esbt/src/index.ts
+index c0d56f4..02aa1b7 100644
+--- a/esbt/src/index.ts
++++ b/esbt/src/index.ts
+@@ -1,13 +1,15 @@
+ /**
+- * Public surface of the ESBT engine that marks will bind to.
++ * Public surface of the ESBT engine.
+  *
+- * Types come from the editor contract. Runtime constructors come from the
+- * implementation modules as they land (doc/weight/vector/undo/ephemeral).
+- * Both are kept so neither the contract PR nor the in-progress impl is lost.
++ * The four runtime constructors marks binds to, the contract types they
++ * satisfy, and the algorithm primitives (weights, NEWSEQ, CREATE_WEIGHT)
++ * for anyone building on the layer below the editor API.
+  */
++
+ export type {
++  EsbtAnchor,
+   EsbtConfig,
+-  EsbtDoc,
++  EsbtDoc as EsbtDocType,
+   EsbtDocStatic,
+   EsbtEvent,
+   EsbtExportOptions,
+@@ -16,15 +18,24 @@ export type {
+   EsbtPresenceState,
+   EsbtTextRange,
+   UndoManager as UndoManagerType,
++  UndoManagerOptions,
+   UndoManagerStatic,
+   VersionVector as VersionVectorType,
+   VersionVectorStatic,
+ } from './api.js';
+ 
+-export type { EphemeralStore, EphemeralStoreStatic } from './ephemeral.js';
++export type { EphemeralStoreStatic } from './ephemeral.js';
+ 
++export { EsbtDoc } from './doc.js';
+ export { VersionVector } from './vector.js';
+ export { UndoManager } from './undo.js';
+-export { EsbtDoc } from './doc.js';
+-export { cmpWeight, newseq, Allocator } from './weight.js';
+-export type { SiteId, Weight } from './weight.js';
++export { EphemeralStore } from './ephemeral.js';
++
++export {
++  Allocator,
++  cmpWeight,
++  newseq,
++  parseWeightKey,
++  weightKey,
++} from './weight.js';
++export type { Fraction, SiteId, Weight } from './weight.js';
+diff --git a/esbt/src/ops.ts b/esbt/src/ops.ts
+new file mode 100644
+index 0000000..4024b77
+--- /dev/null
++++ b/esbt/src/ops.ts
+@@ -0,0 +1,179 @@
++/**
++ * INS(ω, e, c) and DEL(ω, c) — paper §4.2 / §5.2 — plus the two structures
++ * Algorithm 3 needs around them: the pending queue for deletes that arrived
++ * before their insert, and the delete log that makes deletes idempotent and
++ * lets released weights be reused under a fresh counter.
++ */
++
++import { itemId } from './tree.js';
++import { Reader, Writer } from './codec.js';
++import type { SiteId, Weight } from './weight.js';
++import { weight } from './weight.js';
++
++/**
++ * One operation. `seq` is the origin's per-replica sequence number — the
++ * thing the version vector tracks — not the paper's insertion counter `c`,
++ * which lives beside the weight and is what a delete names.
++ *
++ * `unit` is the inserted UTF-16 code unit. On a delete it is populated only
++ * for locally generated ops (the undo manager needs the removed unit to
++ * reinsert it); it is never encoded on the wire for deletes.
++ */
++export interface Op {
++  kind: 'ins' | 'del';
++  site: SiteId;
++  seq: number;
++  weight: Weight;
++  counter: number;
++  unit?: number;
++}
++
++/** Deletes waiting for their matching insert (ω, c). */
++export class PendingQueue {
++  private ops: Op[] = [];
++
++  get length(): number {
++    return this.ops.length;
++  }
++
++  push(op: Op): void {
++    this.ops.push(op);
++  }
++
++  /**
++   * Repeatedly hand every buffered op to `step` until a full pass makes no
++   * progress. `step` returns true when it consumed the op (applied or
++   * discarded it).
++   */
++  drain(step: (op: Op) => boolean): void {
++    let progressed = true;
++    while (progressed) {
++      progressed = false;
++      let i = 0;
++      while (i < this.ops.length) {
++        if (step(this.ops[i])) {
++          this.ops.splice(i, 1);
++          progressed = true;
++        } else {
++          i += 1;
++        }
++      }
++    }
++  }
++
++  snapshot(): Op[] {
++    return [...this.ops];
++  }
++
++  clear(): void {
++    this.ops = [];
++  }
++}
++
++/** Applied deletions, keyed by (ω, c). Scenario 2 idempotence and reuse. */
++export class DeleteLog {
++  private entries = new Map<string, { weight: Weight; counter: number }>();
++
++  has(w: Weight, c: number): boolean {
++    return this.entries.has(itemId(w, c));
++  }
++
++  add(w: Weight, c: number): void {
++    this.entries.set(itemId(w, c), { weight: w, counter: c });
++  }
++
++  values(): Array<{ weight: Weight; counter: number }> {
++    return [...this.entries.values()];
++  }
++
++  get size(): number {
++    return this.entries.size;
++  }
++
++  clear(): void {
++    this.entries.clear();
++  }
++}
++
++/**
++ * Site ids repeat heavily inside one payload, so every payload carries a
++ * site table once and ops reference sites by index.
++ */
++export class SiteTable {
++  private readonly index = new Map<SiteId, number>();
++  readonly sites: SiteId[] = [];
++
++  idOf(site: SiteId): number {
++    let id = this.index.get(site);
++    if (id === undefined) {
++      id = this.sites.length;
++      this.sites.push(site);
++      this.index.set(site, id);
++    }
++    return id;
++  }
++
++  write(w: Writer): void {
++    w.uint(this.sites.length);
++    for (const site of this.sites) w.str(site);
++  }
++
++  static read(r: Reader): SiteId[] {
++    const count = r.uint();
++    const sites: SiteId[] = [];
++    for (let i = 0; i < count; i++) sites.push(r.str());
++    return sites;
++  }
++}
++
++export function writeWeight(w: Writer, table: SiteTable, value: Weight): void {
++  w.int(value.f.p);
++  w.int(value.f.q);
++  w.int(value.sn);
++  w.uint(value.sc.length);
++  for (const digit of value.sc) w.uint(digit);
++  w.uint(table.idOf(value.site));
++}
++
++export function readWeight(r: Reader, sites: SiteId[]): Weight {
++  const p = r.int();
++  const q = r.int();
++  const sn = r.int();
++  const scLen = r.uint();
++  const sc: number[] = [];
++  for (let i = 0; i < scLen; i++) sc.push(r.uint());
++  const siteIdx = r.uint();
++  if (siteIdx >= sites.length) throw new Error('esbt: bad site reference');
++  return weight({ p, q }, sn, sc, sites[siteIdx]);
++}
++
++const OP_INS = 1;
++const OP_DEL = 2;
++
++export function writeOp(w: Writer, table: SiteTable, op: Op): void {
++  w.u8(op.kind === 'ins' ? OP_INS : OP_DEL);
++  w.uint(table.idOf(op.site));
++  w.uint(op.seq);
++  writeWeight(w, table, op.weight);
++  w.uint(op.counter);
++  if (op.kind === 'ins') {
++    // Code units, not UTF-8: an item holding one half of a surrogate pair
++    // must survive the wire byte-for-byte.
++    w.uint(op.unit ?? 0);
++  }
++}
++
++export function readOp(r: Reader, sites: SiteId[]): Op {
++  const tag = r.u8();
++  if (tag !== OP_INS && tag !== OP_DEL) throw new Error('esbt: unknown op tag');
++  const siteIdx = r.uint();
++  if (siteIdx >= sites.length) throw new Error('esbt: bad site reference');
++  const site = sites[siteIdx];
++  const seq = r.uint();
++  const w = readWeight(r, sites);
++  const counter = r.uint();
++  if (tag === OP_INS) {
++    return { kind: 'ins', site, seq, weight: w, counter, unit: r.uint() };
++  }
++  return { kind: 'del', site, seq, weight: w, counter };
++}
+diff --git a/esbt/src/tree.ts b/esbt/src/tree.ts
+index 4def58c..14a639c 100644
+--- a/esbt/src/tree.ts
++++ b/esbt/src/tree.ts
+@@ -1,83 +1,388 @@
+-/** Sequence of live items, ordered by weight. Index = UTF-16 offset. */
++/**
++ * Order-statistic red-black tree over live items, keyed by weight
++ * (paper §4.1). Rank ↔ index in O(log n), which is what turns weight-ordered
++ * storage into the UTF-16 index API the editor speaks.
++ *
++ * Port of `src/rbtree.rs` from maceip/ESBT-web, with subtree sizes maintained
++ * incrementally on the delete path instead of recomputed.
++ */
+ 
+ import { cmpWeight, type Weight, weightKey } from './weight.js';
+ 
++/** One occupancy: a weight, the UTF-16 code unit it carries, and the paper's insertion counter c. */
+ export interface Item {
+   weight: Weight;
+   unit: number;
+   counter: number;
+ }
+ 
++const RED = 0;
++const BLACK = 1;
++
++interface Node {
++  weight: Weight;
++  unit: number;
++  counter: number;
++  color: number;
++  left: Node;
++  right: Node;
++  parent: Node;
++  size: number;
++}
++
++function makeNil(): Node {
++  const nil = {
++    weight: { f: { p: 0, q: 1 }, sn: 0, sc: [0], site: '' },
++    unit: 0,
++    counter: 0,
++    color: BLACK,
++    size: 0,
++  } as Node;
++  nil.left = nil;
++  nil.right = nil;
++  nil.parent = nil;
++  return nil;
++}
++
+ export class DocSeq {
+-  private items: Item[] = [];
++  private nil = makeNil();
++  private root = this.nil;
+ 
+   get length(): number {
+-    return this.items.length;
++    return this.root.size;
+   }
+ 
+-  at(index: number): Item | undefined {
+-    return this.items[index];
++  private pull(x: Node): void {
++    if (x !== this.nil) x.size = 1 + x.left.size + x.right.size;
++  }
++
++  private rotateLeft(x: Node): void {
++    const y = x.right;
++    x.right = y.left;
++    if (y.left !== this.nil) y.left.parent = x;
++    y.parent = x.parent;
++    if (x.parent === this.nil) this.root = y;
++    else if (x === x.parent.left) x.parent.left = y;
++    else x.parent.right = y;
++    y.left = x;
++    x.parent = y;
++    this.pull(x);
++    this.pull(y);
++  }
++
++  private rotateRight(x: Node): void {
++    const y = x.left;
++    x.left = y.right;
++    if (y.right !== this.nil) y.right.parent = x;
++    y.parent = x.parent;
++    if (x.parent === this.nil) this.root = y;
++    else if (x === x.parent.right) x.parent.right = y;
++    else x.parent.left = y;
++    y.right = x;
++    x.parent = y;
++    this.pull(x);
++    this.pull(y);
++  }
++
++  private node(w: Weight): Node {
++    let x = this.root;
++    while (x !== this.nil) {
++      const c = cmpWeight(w, x.weight);
++      if (c === 0) return x;
++      x = c < 0 ? x.left : x.right;
++    }
++    return this.nil;
+   }
+ 
+   find(w: Weight): Item | undefined {
+-    const i = this.indexOfWeight(w);
+-    return i < 0 ? undefined : this.items[i];
++    const n = this.node(w);
++    if (n === this.nil) return undefined;
++    return { weight: n.weight, unit: n.unit, counter: n.counter };
+   }
+ 
+   has(w: Weight): boolean {
+-    return this.indexOfWeight(w) >= 0;
++    return this.node(w) !== this.nil;
+   }
+ 
++  /** Index of the item with exactly this weight, or -1. */
+   indexOfWeight(w: Weight): number {
+-    let lo = 0;
+-    let hi = this.items.length - 1;
+-    while (lo <= hi) {
+-      const mid = (lo + hi) >> 1;
+-      const c = cmpWeight(w, this.items[mid].weight);
+-      if (c === 0) return mid;
+-      if (c < 0) hi = mid - 1;
+-      else lo = mid + 1;
++    let x = this.root;
++    let rank = 0;
++    while (x !== this.nil) {
++      const c = cmpWeight(w, x.weight);
++      if (c < 0) {
++        x = x.left;
++      } else if (c > 0) {
++        rank += x.left.size + 1;
++        x = x.right;
++      } else {
++        return rank + x.left.size;
++      }
+     }
+     return -1;
+   }
+ 
+-  insert(item: Item): boolean {
+-    if (this.has(item.weight)) return false;
+-    let lo = 0;
+-    let hi = this.items.length;
+-    while (lo < hi) {
+-      const mid = (lo + hi) >> 1;
+-      if (cmpWeight(item.weight, this.items[mid].weight) < 0) hi = mid;
+-      else lo = mid + 1;
++  /** Rank of the first item whose weight is ≥ `w` (== length when all are smaller). */
++  lowerBound(w: Weight): number {
++    let x = this.root;
++    let rank = 0;
++    while (x !== this.nil) {
++      if (cmpWeight(w, x.weight) <= 0) {
++        x = x.left;
++      } else {
++        rank += x.left.size + 1;
++        x = x.right;
++      }
+     }
+-    this.items.splice(lo, 0, item);
+-    return true;
++    return rank;
+   }
+ 
+-  delete(w: Weight): Item | undefined {
+-    const i = this.indexOfWeight(w);
+-    if (i < 0) return undefined;
+-    const [gone] = this.items.splice(i, 1);
+-    return gone;
++  at(index: number): Item | undefined {
++    if (index < 0 || index >= this.length) return undefined;
++    let x = this.root;
++    for (;;) {
++      const ls = x.left.size;
++      if (index < ls) {
++        x = x.left;
++      } else if (index === ls) {
++        return { weight: x.weight, unit: x.unit, counter: x.counter };
++      } else {
++        index -= ls + 1;
++        x = x.right;
++      }
++    }
+   }
+ 
+-  text(): string {
+-    return String.fromCharCode(...this.items.map((it) => it.unit));
++  /** Insert an item; returns its resulting index, or -1 if the weight is already present. */
++  insert(item: Item): number {
++    if (this.has(item.weight)) return -1;
++
++    const z = {
++      weight: item.weight,
++      unit: item.unit,
++      counter: item.counter,
++      color: RED,
++      left: this.nil,
++      right: this.nil,
++      parent: this.nil,
++      size: 1,
++    } as Node;
++
++    let y = this.nil;
++    let x = this.root;
++    let rank = 0;
++    while (x !== this.nil) {
++      y = x;
++      x.size += 1;
++      if (cmpWeight(z.weight, x.weight) < 0) {
++        x = x.left;
++      } else {
++        rank += x.left.size + 1;
++        x = x.right;
++      }
++    }
++    z.parent = y;
++    if (y === this.nil) this.root = z;
++    else if (cmpWeight(z.weight, y.weight) < 0) y.left = z;
++    else y.right = z;
++
++    this.insertFix(z);
++    return rank;
++  }
++
++  private insertFix(z: Node): void {
++    while (z.parent.color === RED) {
++      const p = z.parent;
++      const g = p.parent;
++      if (p === g.left) {
++        const u = g.right;
++        if (u.color === RED) {
++          p.color = BLACK;
++          u.color = BLACK;
++          g.color = RED;
++          z = g;
++        } else {
++          if (z === p.right) {
++            z = p;
++            this.rotateLeft(z);
++          }
++          z.parent.color = BLACK;
++          z.parent.parent.color = RED;
++          this.rotateRight(z.parent.parent);
++        }
++      } else {
++        const u = g.left;
++        if (u.color === RED) {
++          p.color = BLACK;
++          u.color = BLACK;
++          g.color = RED;
++          z = g;
++        } else {
++          if (z === p.left) {
++            z = p;
++            this.rotateRight(z);
++          }
++          z.parent.color = BLACK;
++          z.parent.parent.color = RED;
++          this.rotateLeft(z.parent.parent);
++        }
++      }
++    }
++    this.root.color = BLACK;
++  }
++
++  private transplant(u: Node, v: Node): void {
++    if (u.parent === this.nil) this.root = v;
++    else if (u === u.parent.left) u.parent.left = v;
++    else u.parent.right = v;
++    // Unconditional, CLRS-style: v may be the nil sentinel, whose parent
++    // field is scratch space the delete fixup reads.
++    v.parent = u.parent;
++  }
++
++  private minimum(x: Node): Node {
++    while (x.left !== this.nil) x = x.left;
++    return x;
++  }
++
++  /** Remove the item with this weight; returns it and the index it occupied. */
++  delete(w: Weight): { item: Item; index: number } | undefined {
++    const z = this.node(w);
++    if (z === this.nil) return undefined;
++
++    const index = this.indexOfWeight(w);
++    const item: Item = { weight: z.weight, unit: z.unit, counter: z.counter };
++
++    // The node physically unlinked is z itself, or its in-order successor.
++    const removed = z.left === this.nil || z.right === this.nil ? z : this.minimum(z.right);
++    for (let a = removed.parent; a !== this.nil; a = a.parent) a.size -= 1;
++
++    let y = z;
++    let yColor = y.color;
++    let x: Node;
++    if (z.left === this.nil) {
++      x = z.right;
++      this.transplant(z, z.right);
++    } else if (z.right === this.nil) {
++      x = z.left;
++      this.transplant(z, z.left);
++    } else {
++      y = removed;
++      yColor = y.color;
++      x = y.right;
++      if (y.parent === z) {
++        x.parent = y;
++      } else {
++        this.transplant(y, y.right);
++        y.right = z.right;
++        y.right.parent = y;
++      }
++      this.transplant(z, y);
++      y.left = z.left;
++      y.left.parent = y;
++      y.color = z.color;
++      y.size = z.size; // z.size was already decremented by the ancestor walk
++    }
++
++    if (yColor === BLACK) this.deleteFix(x);
++    this.nil.parent = this.nil;
++    return { item, index };
+   }
+ 
++  private deleteFix(x: Node): void {
++    while (x !== this.root && x.color === BLACK) {
++      const p = x.parent;
++      if (x === p.left) {
++        let w = p.right;
++        if (w.color === RED) {
++          w.color = BLACK;
++          p.color = RED;
++          this.rotateLeft(p);
++          w = p.right;
++        }
++        if (w.left.color === BLACK && w.right.color === BLACK) {
++          w.color = RED;
++          x = p;
++        } else {
++          if (w.right.color === BLACK) {
++            w.left.color = BLACK;
++            w.color = RED;
++            this.rotateRight(w);
++            w = p.right;
++          }
++          w.color = p.color;
++          p.color = BLACK;
++          w.right.color = BLACK;
++          this.rotateLeft(p);
++          x = this.root;
++        }
++      } else {
++        let w = p.left;
++        if (w.color === RED) {
++          w.color = BLACK;
++          p.color = RED;
++          this.rotateRight(p);
++          w = p.left;
++        }
++        if (w.right.color === BLACK && w.left.color === BLACK) {
++          w.color = RED;
++          x = p;
++        } else {
++          if (w.left.color === BLACK) {
++            w.right.color = BLACK;
++            w.color = RED;
++            this.rotateLeft(w);
++            w = p.left;
++          }
++          w.color = p.color;
++          p.color = BLACK;
++          w.left.color = BLACK;
++          this.rotateRight(p);
++          x = this.root;
++        }
++      }
++    }
++    x.color = BLACK;
++  }
++
++  /** In-order items. O(n); used by snapshots, not by editing. */
+   atoms(): Item[] {
+-    return this.items.map((it) => ({
+-      weight: it.weight,
+-      unit: it.unit,
+-      counter: it.counter,
+-    }));
++    const out: Item[] = [];
++    const walk = (x: Node): void => {
++      if (x === this.nil) return;
++      walk(x.left);
++      out.push({ weight: x.weight, unit: x.unit, counter: x.counter });
++      walk(x.right);
++    };
++    walk(this.root);
++    return out;
++  }
++
++  /** Visible text rebuilt from the tree. O(n); the doc keeps an incremental cache instead. */
++  text(): string {
++    const units = new Array<number>(this.length);
++    let i = 0;
++    const walk = (x: Node): void => {
++      if (x === this.nil) return;
++      walk(x.left);
++      units[i++] = x.unit;
++      walk(x.right);
++    };
++    walk(this.root);
++    let s = '';
++    const CHUNK = 8192;
++    for (let start = 0; start < units.length; start += CHUNK) {
++      s += String.fromCharCode(...units.slice(start, start + CHUNK));
++    }
++    return s;
+   }
+ 
+   clear(): void {
+-    this.items = [];
++    this.root = this.nil;
+   }
+ }
+ 
++/** Map key for one occupancy (ω, c). */
+ export function itemId(w: Weight, c: number): string {
+   return `${weightKey(w)}#${c}`;
+ }
+diff --git a/esbt/src/undo.ts b/esbt/src/undo.ts
+index 73053f6..a8ce15d 100644
+--- a/esbt/src/undo.ts
++++ b/esbt/src/undo.ts
+@@ -1,18 +1,50 @@
++/**
++ * Per-peer undo. Only operations this replica generated are undoable —
++ * imports never enter the stacks — and undoing emits *new* operations
++ * (a delete of our insert, or a reinsert of a deleted item under a fresh
++ * counter) so every peer converges on the result.
++ */
++
++import type { EsbtDoc as EsbtDocContract, UndoManagerOptions } from './api.js';
+ import type { EsbtDoc } from './doc.js';
+ import type { Op } from './ops.js';
+ 
+ export class UndoManager {
+   private undoStack: Op[][] = [];
+   private redoStack: Op[][] = [];
+-  private doc: EsbtDoc;
+-  private unhook: (() => void) | null = null;
++  private readonly doc: EsbtDoc;
++  private readonly mergeIntervalMs: number;
++  private lastPushAt = 0;
++  private destroyed = false;
++
++  constructor(doc: EsbtDocContract, options: UndoManagerOptions = {}) {
++    const impl = doc as unknown as EsbtDoc;
++    if (typeof impl._setUndoHook !== 'function' || typeof impl._applyUndoOps !== 'function') {
++      throw new Error('esbt: UndoManager requires an EsbtDoc from this package');
++    }
++    this.doc = impl;
++    this.mergeIntervalMs = Math.max(0, options.mergeIntervalMs ?? 0);
+ 
+-  constructor(doc: EsbtDoc) {
+-    this.doc = doc;
+-    doc._setUndoHook((ops, origin) => {
++    impl._setUndoHook((ops, origin) => {
+       if (origin === 'undo' || origin === 'redo') return;
+-      if (!ops.length) return;
+-      this.undoStack.push(ops);
++      if (ops.length === 0) return;
++
++      const now = Date.now();
++      const top = this.undoStack[this.undoStack.length - 1];
++      // Group bursts of transacts (keystrokes) into one undo step, the way
++      // Loro's UndoManager and Y.UndoManager's captureTimeout do. Never merge
++      // across an undo/redo boundary: that would swallow the redo history.
++      if (
++        top !== undefined &&
++        this.mergeIntervalMs > 0 &&
++        now - this.lastPushAt <= this.mergeIntervalMs &&
++        this.redoStack.length === 0
++      ) {
++        top.push(...ops);
++      } else {
++        this.undoStack.push([...ops]);
++      }
++      this.lastPushAt = now;
+       this.redoStack = [];
+     });
+   }
+@@ -26,23 +58,34 @@ export class UndoManager {
+   }
+ 
+   undo(): void {
+-    const batch = this.undoStack.pop();
+-    if (!batch) return;
+-    const inverse = this.doc._applyUndoOps([...batch].reverse(), 'undo');
+-    this.redoStack.push(inverse);
++    // A step can be a no-op when collaborators already deleted everything it
++    // touched; fall through to the next one so the key always does something.
++    while (this.undoStack.length > 0) {
++      const batch = this.undoStack.pop()!;
++      const inverse = this.doc._applyUndoOps([...batch].reverse(), 'undo');
++      if (inverse.length > 0) {
++        this.redoStack.push(inverse);
++        return;
++      }
++    }
+   }
+ 
+   redo(): void {
+-    const batch = this.redoStack.pop();
+-    if (!batch) return;
+-    const inverse = this.doc._applyUndoOps(batch, 'redo');
+-    this.undoStack.push(inverse);
++    while (this.redoStack.length > 0) {
++      const batch = this.redoStack.pop()!;
++      const inverse = this.doc._applyUndoOps(batch, 'redo');
++      if (inverse.length > 0) {
++        this.undoStack.push(inverse);
++        return;
++      }
++    }
+   }
+ 
+   destroy(): void {
++    if (this.destroyed) return;
++    this.destroyed = true;
+     this.doc._setUndoHook(null);
+     this.undoStack = [];
+     this.redoStack = [];
+-    this.unhook = null;
+   }
+ }
+diff --git a/esbt/src/vector.ts b/esbt/src/vector.ts
+index ddc8a6a..dafc004 100644
+--- a/esbt/src/vector.ts
++++ b/esbt/src/vector.ts
+@@ -1,6 +1,11 @@
+ import { Reader, TAG_VV, Writer, readVersion, writeVersion } from './codec.js';
+ import type { SiteId } from './weight.js';
+ 
++/**
++ * site → max seq. This is transport bookkeeping (which ops a replica has
++ * integrated), not the paper's insertion counter `c`. Encoded size grows
++ * with the number of sites that ever wrote, never with document length.
++ */
+ export class VersionVector {
+   readonly next: Map<SiteId, number>;
+ 
+@@ -12,17 +17,14 @@ export class VersionVector {
+     const w = new Writer();
+     w.u8(TAG_VV);
+     writeVersion(w, this.next);
+-    return w.bytes();
++    return w.done();
+   }
+ 
+   static decode(bytes: Uint8Array): VersionVector {
+     if (!bytes || bytes.length === 0) return new VersionVector();
+     const r = new Reader(bytes);
+     const tag = r.u8();
+-    if (tag !== TAG_VV && tag !== 0) {
+-      const r2 = new Reader(bytes);
+-      return new VersionVector(readVersion(r2));
+-    }
++    if (tag !== TAG_VV) throw new Error(`esbt: not a version vector (tag ${tag})`);
+     return new VersionVector(readVersion(r));
+   }
+ }
+diff --git a/esbt/src/weight.ts b/esbt/src/weight.ts
+new file mode 100644
+index 0000000..428059b
+--- /dev/null
++++ b/esbt/src/weight.ts
+@@ -0,0 +1,393 @@
++/**
++ * Weight layer: Definition 1 (weight), Definition 2 (total order),
++ * Algorithm 1 (NEWSEQ) and Algorithm 2 (CREATE_WEIGHT with the site Tracker,
++ * Definition 4). Ported from the Rust reference implementation in
++ * maceip/ESBT-web (`src/fraction.rs`, `src/weight.rs`, `src/newseq.rs`,
++ * `src/allocator.rs`).
++ *
++ * Differences from the Rust core, required by the marks contract:
++ *   - `SiteId` is an opaque string (the contract's replica id), not a u32.
++ *     The final tie-break of Definition 2 uses code-unit order on that string,
++ *     which is total and identical on every replica.
++ *   - NEWSEQ's tie digit is derived from a stable 32-bit FNV-1a hash of the
++ *     site id, standing in for the paper's numeric `siteId mod (base − 1)`.
++ */
++
++/** Replica / site identifier. Opaque, comparable, stable for the life of a doc instance. */
++export type SiteId = string;
++
++/** Site id reserved for the sentinels W_BEGIN / W_END. */
++export const SENTINEL_SITE: SiteId = '';
++
++/**
++ * Stern–Brocot rational p/q. Sentinels: W_BEGIN = 0/1, W_END = 1/0.
++ * Numerator and denominator stay below Dmax (Theorem 2), so plain numbers
++ * hold them exactly; comparison falls back to BigInt only when a cross
++ * product could leave the float53 exact-integer range.
++ */
++export interface Fraction {
++  p: number;
++  q: number;
++}
++
++export const F_BEGIN: Fraction = { p: 0, q: 1 };
++export const F_END: Fraction = { p: 1, q: 0 };
++
++export function gcd(a: number, b: number): number {
++  a = Math.abs(a);
++  b = Math.abs(b);
++  while (b !== 0) {
++    const t = a % b;
++    a = b;
++    b = t;
++  }
++  return a === 0 ? 1 : a;
++}
++
++export function fraction(p: number, q: number): Fraction {
++  if (q === 0) return F_END;
++  if (p === 0) return F_BEGIN;
++  if (q < 0) {
++    p = -p;
++    q = -q;
++  }
++  const g = gcd(p, q);
++  return { p: p / g, q: q / g };
++}
++
++export function isBegin(f: Fraction): boolean {
++  return f.p === 0 && f.q !== 0;
++}
++
++export function isEnd(f: Fraction): boolean {
++  return f.q === 0;
++}
++
++export function mediant(a: Fraction, b: Fraction): Fraction {
++  return fraction(a.p + b.p, a.q + b.q);
++}
++
++/** Cross products stay exact in a float64 while both factors are below 2^26. */
++const EXACT_FACTOR = 0x4000000;
++
++/** Cross-multiply compare; 0/1 < finite < 1/0. */
++export function cmpFraction(a: Fraction, b: Fraction): number {
++  if (a.p === b.p && a.q === b.q) return 0;
++  if (isBegin(a)) return -1;
++  if (isBegin(b)) return 1;
++  if (isEnd(a)) return 1;
++  if (isEnd(b)) return -1;
++  if (a.p < EXACT_FACTOR && a.q < EXACT_FACTOR && b.p < EXACT_FACTOR && b.q < EXACT_FACTOR) {
++    const left = a.p * b.q;
++    const right = b.p * a.q;
++    return left < right ? -1 : left > right ? 1 : 0;
++  }
++  const left = BigInt(a.p) * BigInt(b.q);
++  const right = BigInt(b.p) * BigInt(a.q);
++  return left < right ? -1 : left > right ? 1 : 0;
++}
++
++/** W = ⟨f, sn, sc, δ⟩. Sentinels use δ = ∅ encoded as the empty site id. */
++export interface Weight {
++  f: Fraction;
++  sn: number;
++  sc: number[];
++  site: SiteId;
++}
++
++export function weight(f: Fraction, sn: number, sc: number[], site: SiteId): Weight {
++  return { f, sn, sc: sc.length === 0 ? [0] : sc, site };
++}
++
++export function weightBegin(): Weight {
++  return weight(F_BEGIN, 0, [0], SENTINEL_SITE);
++}
++
++export function weightEnd(): Weight {
++  return weight(F_END, 0, [0], SENTINEL_SITE);
++}
++
++/**
++ * Definition 5. If one path is a proper prefix, the shorter precedes
++ * (needed for Situation 3: [0] ≺ [0,5]).
++ */
++export function cmpSeqPath(a: readonly number[], b: readonly number[]): number {
++  const n = Math.min(a.length, b.length);
++  for (let i = 0; i < n; i++) {
++    if (a[i] !== b[i]) return a[i] < b[i] ? -1 : 1;
++  }
++  return a.length - b.length;
++}
++
++/** Definition 2: lexicographic on (f, sn, sc, site). */
++export function cmpWeight(a: Weight, b: Weight): number {
++  const cf = cmpFraction(a.f, b.f);
++  if (cf !== 0) return cf;
++  if (a.sn !== b.sn) return a.sn < b.sn ? -1 : 1;
++  const cs = cmpSeqPath(a.sc, b.sc);
++  if (cs !== 0) return cs;
++  // Code-unit comparison: total, deterministic, locale-independent.
++  return a.site < b.site ? -1 : a.site > b.site ? 1 : 0;
++}
++
++/**
++ * Canonical string form of a weight: `p/q:sn:sc0.sc1…@site`.
++ *
++ * This is the `EsbtItemId.weight` of the contract — stable across replicas,
++ * usable as a map key, and parseable (everything before the first `@` is
++ * numeric, the site is the remainder, whatever characters it contains).
++ */
++export function weightKey(w: Weight): string {
++  return `${w.f.p}/${w.f.q}:${w.sn}:${w.sc.join('.')}@${w.site}`;
++}
++
++export function parseWeightKey(key: string): Weight {
++  const at = key.indexOf('@');
++  if (at < 0) throw new Error(`esbt: malformed weight key ${JSON.stringify(key)}`);
++  const head = key.slice(0, at);
++  const site = key.slice(at + 1);
++  const parts = head.split(':');
++  if (parts.length !== 3) throw new Error(`esbt: malformed weight key ${JSON.stringify(key)}`);
++  const [pq, snRaw, scRaw] = parts;
++  const slash = pq.indexOf('/');
++  if (slash < 0) throw new Error(`esbt: malformed weight key ${JSON.stringify(key)}`);
++  const p = Number(pq.slice(0, slash));
++  const q = Number(pq.slice(slash + 1));
++  const sn = Number(snRaw);
++  const sc = scRaw === '' ? [0] : scRaw.split('.').map(Number);
++  if (!Number.isFinite(p) || !Number.isFinite(q) || !Number.isFinite(sn) || sc.some((d) => !Number.isFinite(d))) {
++    throw new Error(`esbt: malformed weight key ${JSON.stringify(key)}`);
++  }
++  return weight({ p, q }, sn, sc, site);
++}
++
++/** FNV-1a over UTF-16 code units; the numeric stand-in for a string site id. */
++export function siteHash(site: SiteId): number {
++  let h = 0x811c9dc5;
++  for (let i = 0; i < site.length; i++) {
++    h ^= site.charCodeAt(i);
++    h = Math.imul(h, 0x01000193);
++  }
++  return h >>> 0;
++}
++
++/** Algorithm 1 — NEWSEQ(left, right, base, DEPTH). */
++export function newseq(
++  left: readonly number[],
++  right: readonly number[],
++  base: number,
++  maxDepth: number,
++  site: SiteId,
++): number[] {
++  const sc: number[] = [];
++  const maxD = Math.max(1, maxDepth);
++  const b = Math.max(2, base);
++  let depth = 0;
++
++  for (;;) {
++    const lv = depth < left.length ? left[depth] : 0;
++    const rv = depth < right.length ? right[depth] : b;
++    const interval = Math.max(0, rv - lv - 1);
++
++    if (interval > 0) {
++      let value = lv + Math.floor(interval / 2) + 1;
++      if (value >= rv) value = rv - 1;
++      sc.push(value);
++      return sc;
++    }
++
++    sc.push(lv);
++    depth += 1;
++    if (depth >= maxD) {
++      // paper: tie = 1 + (siteId mod (base − 1))
++      sc.push(1 + (siteHash(site) % (b - 1)));
++      return sc;
++    }
++  }
++}
++
++/**
++ * NEWSEQ without the depth cap. The paper's tie digit is constant per site,
++ * so once a region of the tree is deeper than DEPTH the capped walk returns
++ * the same path for every call and the same site can never mint there twice.
++ * This variant keeps walking instead; it terminates within
++ * max(left.length, right.length) + 1 levels, and whenever left < right in
++ * path order the result is strictly between them.
++ */
++export function newseqUnbounded(
++  left: readonly number[],
++  right: readonly number[],
++  base: number,
++): number[] {
++  const sc: number[] = [];
++  const b = Math.max(2, base);
++  const limit = Math.max(left.length, right.length) + 1;
++
++  for (let depth = 0; depth <= limit; depth++) {
++    const lv = depth < left.length ? left[depth] : 0;
++    const rv = depth < right.length ? right[depth] : b;
++    const interval = Math.max(0, rv - lv - 1);
++
++    if (interval > 0) {
++      let value = lv + Math.floor(interval / 2) + 1;
++      if (value >= rv) value = rv - 1;
++      sc.push(value);
++      return sc;
++    }
++    sc.push(lv);
++  }
++  return sc;
++}
++
++/** Tracker : f ↦ (snL, snR). Only fractions that have hit Dmax are tracked (Definition 4). */
++export class Tracker {
++  private map = new Map<string, [number, number]>();
++
++  pair(f: Fraction): [number, number] {
++    const key = `${f.p}/${f.q}`;
++    let entry = this.map.get(key);
++    if (!entry) {
++      entry = [0, 0];
++      this.map.set(key, entry);
++    }
++    return entry;
++  }
++
++  set(f: Fraction, snL: number, snR: number): void {
++    this.map.set(`${f.p}/${f.q}`, [snL, snR]);
++  }
++
++  clear(): void {
++    this.map.clear();
++  }
++}
++
++/**
++ * Algorithm 2 — CREATE_WEIGHT, hardened.
++ *
++ * Two corrections over a literal transcription of the paper (and over the
++ * Rust reference), both discovered by fuzzing convergence:
++ *
++ * 1. The mediant applies only when it *strictly* separates the neighbours.
++ *    Between two weights with equal fractions — an sn-ladder pair, or
++ *    concurrent same-gap inserts — mediant(f, f) = f, which "fits" and
++ *    would reproduce an existing weight (dropping the character) or land
++ *    on an arbitrary side of its neighbours by the site tie-break. The
++ *    paper's own Situation 3 routes this case to the sequence path.
++ *
++ * 2. The sn ladder derives its value from the tracker *and* the actual
++ *    neighbours. The tracker resets on rehydrate and knows nothing about
++ *    weights minted by other sites, so `snR + 1` alone can collide with or
++ *    overshoot a live neighbour.
++ *
++ * Every candidate is verified strictly between the neighbours before it is
++ * returned. When no weight can exist in the gap — the neighbours differ
++ * only by site, a "twin pinch" — `createWeight` returns null and the
++ * document widens the gap instead (see `EsbtDoc`). Fresh weights carry a
++ * site-flavoured first path digit precisely so that twins require a 32-bit
++ * hash collision on top of concurrency, instead of happening on every
++ * concurrent same-gap insert.
++ */
++export class Allocator {
++  readonly dmax: number;
++  readonly base: number;
++  readonly depth: number;
++  readonly tracker = new Tracker();
++
++  constructor(dmax: number, base: number, depth: number) {
++    this.dmax = Math.max(2, dmax);
++    this.base = Math.max(2, base);
++    this.depth = Math.max(1, depth);
++  }
++
++  /**
++   * Theorem 2: assign the mediant iff max(num, den) is within Dmax.
++   *
++   * Algorithm 2 line 10 is typeset with `or`, which would admit unbounded
++   * denominators and contradict line 9, Lemma 1's bound, Theorem 2, and
++   * Situation 1 (3/7 rejected at Dmax = 5). The formal statements win —
++   * same reading as the Rust reference.
++   */
++  mediantFits(f: Fraction): boolean {
++    return !isBegin(f) && !isEnd(f) && f.p < this.dmax && f.q < this.dmax;
++  }
++
++  /** First path digit of a fresh weight: the NEWSEQ tie for this site. */
++  private siteDigit(site: SiteId): number {
++    return 1 + (siteHash(site) % (this.base - 1));
++  }
++
++  createWeight(left: Weight, right: Weight, site: SiteId): Weight | null {
++    const between = (w: Weight): Weight | null =>
++      cmpWeight(left, w) < 0 && cmpWeight(w, right) < 0 ? w : null;
++
++    // Fraction layer: the mediant, when it fits and strictly separates.
++    const fm = mediant(left.f, right.f);
++    if (this.mediantFits(fm) && cmpFraction(left.f, fm) < 0 && cmpFraction(fm, right.f) < 0) {
++      const w = between(weight(fm, 0, [this.siteDigit(site)], site));
++      if (w) return w;
++    }
++
++    // Fallback fraction. Sentinel 0/1 → use the right.
++    const fb = isBegin(left.f) ? right.f : left.f;
++    const [snL, snR] = this.tracker.pair(fb);
++    const fbVsRight = cmpFraction(fb, right.f);
++    const leftAtFb = cmpFraction(left.f, fb) === 0 && !isBegin(left.f);
++
++    // Right allocation: one step up the ladder, above the left neighbour.
++    {
++      const sn = Math.max(snR, leftAtFb ? left.sn : snR) + 1;
++      if (fbVsRight < 0 || (fbVsRight === 0 && sn < right.sn)) {
++        const w = between(weight(fb, sn, [...left.sc], site));
++        if (w) {
++          this.tracker.set(fb, snL, sn);
++          return w;
++        }
++      }
++    }
++
++    // Left allocation: one step down the ladder, below the right neighbour.
++    if (fbVsRight === 0) {
++      const sn = Math.min(snL, right.sn) - 1;
++      if (!leftAtFb || sn > left.sn) {
++        const w = between(weight(fb, sn, [...left.sc], site));
++        if (w) {
++          this.tracker.set(fb, sn, snR);
++          return w;
++        }
++      }
++    }
++
++    // Interior of a ladder: an integer strictly between the neighbours' sn.
++    if (leftAtFb && fbVsRight === 0 && right.sn - left.sn > 1) {
++      const sn = left.sn + Math.floor((right.sn - left.sn) / 2);
++      const w = between(weight(fb, sn, [this.siteDigit(site)], site));
++      if (w) return w;
++    }
++
++    // Sequence path (Situation 3): same fraction, no sn room — split by sc.
++    {
++      const sc = newseq(left.sc, right.sc, this.base, this.depth, site);
++      const w = between(weight(fb, left.sn, sc, site));
++      if (w) return w;
++    }
++
++    // Depth exhaustion: past DEPTH the capped walk's constant tie digit can
++    // reproduce a path this site already minted. Walk without the cap; that
++    // succeeds whenever the neighbours' paths differ at all.
++    {
++      const sc = newseqUnbounded(left.sc, right.sc, this.base);
++      const w = between(weight(fb, left.sn, sc, site));
++      if (w) return w;
++    }
++
++    // Twin pinch: the neighbours differ only by site. The single admissible
++    // weight is their (f, sn, sc) with a site sorting between theirs.
++    {
++      const w = between(weight(fb, left.sn, [...left.sc], site));
++      if (w) return w;
++    }
++
++    return null;
++  }
++}
+diff --git a/esbt/tsconfig.build.json b/esbt/tsconfig.build.json
+new file mode 100644
+index 0000000..8635027
+--- /dev/null
++++ b/esbt/tsconfig.build.json
+@@ -0,0 +1,10 @@
++{
++  "extends": "./tsconfig.json",
++  "compilerOptions": {
++    "noEmit": false,
++    "declaration": true,
++    "outDir": "dist",
++    "rootDir": "src"
++  },
++  "include": ["src"]
++}
+diff --git a/esbt/tsconfig.json b/esbt/tsconfig.json
+index cadd224..4c841d6 100644
+--- a/esbt/tsconfig.json
++++ b/esbt/tsconfig.json
+@@ -1,14 +1,17 @@
+ {
+   "compilerOptions": {
+     "target": "ES2022",
+-    "module": "ES2022",
+-    "moduleResolution": "bundler",
++    "module": "NodeNext",
++    "moduleResolution": "NodeNext",
+     "lib": ["ES2023"],
++    "types": ["node"],
+     "strict": true,
+     "noEmit": true,
+     "skipLibCheck": true,
+     "forceConsistentCasingInFileNames": true,
+-    "exactOptionalPropertyTypes": true
++    "exactOptionalPropertyTypes": true,
++    "noUnusedLocals": false,
++    "verbatimModuleSyntax": true
+   },
+   "include": ["src"]
+ }
+-- 
+2.43.0
+

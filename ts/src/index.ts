@@ -24,7 +24,10 @@ export type {
   VersionVectorStatic,
 } from './api.js';
 
-export type { EphemeralStoreStatic } from './ephemeral.js';
+export type {
+  EphemeralStore as EphemeralStoreType,
+  EphemeralStoreStatic,
+} from './ephemeral.js';
 
 export { EsbtDoc } from './doc.js';
 export { VersionVector } from './vector.js';
