@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ESBT — collaborative document</title>
+  <style>
+    :root {
+      --bg: #f3efe6; --ink: #1b1914; --muted: #5e584e; --line: #d4cdc0;
+      --card: #fffcf7; --go: #1c5c48; --bad: #8c2f10;
+      --sans: Palatino, "Iowan Old Style", Georgia, serif;
+      --mono: ui-monospace, "IBM Plex Mono", monospace;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--ink); font: 16px/1.45 var(--sans); }
+    header {
+      display: flex; flex-wrap: wrap; gap: .6rem 1.2rem; align-items: baseline;
+      padding: .9rem 1.2rem; border-bottom: 1px solid var(--line);
+    }
+    header h1 { font-size: 1.15rem; margin: 0; }
+    header .sub { color: var(--muted); font-size: .9rem; }
+    #doc {
+      width: min(52rem, 100%); margin: 1rem auto; min-height: 60vh;
+      padding: 1.25rem 1.4rem; background: var(--card);
+      border: 1px solid var(--line); border-radius: 8px;
+      font: 1.05rem/1.55 var(--sans); white-space: pre-wrap; outline: none;
+    }
+    #doc:empty:before { content: "Type here. Open this room URL on another device."; color: #a39b8c; }
+    .bar {
+      width: min(52rem, 100%); margin: 0 auto 1.5rem; padding: 0 1.2rem;
+      display: flex; flex-wrap: wrap; gap: .5rem .8rem; align-items: center;
+      font-size: .85rem; color: var(--muted);
+    }
+    button, select {
+      font: 13px var(--sans); padding: .3rem .6rem; border-radius: 6px;
+      border: 1px solid var(--line); background: #fff; cursor: pointer;
+    }
+    button.primary { background: var(--go); color: #fff; border-color: var(--go); }
+    .ok { color: var(--go); } .bad { color: var(--bad); }
+    textarea.sdp { width: min(52rem, calc(100% - 2.4rem)); margin: 0 1.2rem 1rem;
+      min-height: 4rem; font: 11px var(--mono); }
+    details { width: min(52rem, 100%); margin: 0 auto 1rem; padding: 0 1.2rem; }
+    pre { font: 11px/1.35 var(--mono); background: #1b1914; color: #f3efe6;
+      padding: .7rem; border-radius: 6px; overflow: auto; max-height: 14rem; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>ESBT document</h1>
+    <span class="sub">Rust CRDT in Wasm · epidemic mesh · arXiv:2607.28101</span>
+    <span id="status">loading…</span>
+  </header>
+  <div id="doc" contenteditable="true" spellcheck="false" role="textbox"></div>
+  <div class="bar">
+    <span id="meta"></span>
+    <button id="copy">Copy room link</button>
+    <button id="offer">WebRTC offer</button>
+    <button id="accept">Accept offer</button>
+    <button id="finish">Apply answer</button>
+    <button id="verify">Paper tests</button>
+  </div>
+  <textarea class="sdp" id="sdp" placeholder="Paste a remote SDP offer or answer"></textarea>
+  <details>
+    <summary>Weights (live identifiers)</summary>
+    <pre id="weights">[]</pre>
+  </details>
+  <details>
+    <summary>Verification log</summary>
+    <pre id="vlog">—</pre>
+  </details>
+  <script type="module" src="./editor.js"></script>
+</body>
+</html>
