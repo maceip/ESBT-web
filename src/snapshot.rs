@@ -1,4 +1,6 @@
 //! Join/leave state transfer. Paper §4: sites may join at any time.
+//! Epidemic of live ops is not enough for a late replica; it needs the
+//! current document plus the delete log L (Scenario 2).
 
 use crate::clock::Version;
 use crate::fraction::Fraction;
@@ -123,6 +125,7 @@ fn read_weight(buf: &[u8], i: &mut usize) -> Option<Weight> {
     Some(Weight::new(Fraction { p, q }, sn, sc, site))
 }
 
+/// Envelope on the epidemic mesh.
 #[derive(Clone, Debug)]
 pub enum Message {
     Op(Op),
