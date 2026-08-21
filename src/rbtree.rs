@@ -311,8 +311,14 @@ impl DocTree {
     }
 
     fn recompute(&mut self, i: usize) -> usize {
-        let ls = self.nodes[i].left.map(|l| self.recompute(l)).unwrap_or(0);
-        let rs = self.nodes[i].right.map(|r| self.recompute(r)).unwrap_or(0);
+        let ls = self.nodes[i]
+            .left
+            .map(|l| self.recompute(l))
+            .unwrap_or(0);
+        let rs = self.nodes[i]
+            .right
+            .map(|r| self.recompute(r))
+            .unwrap_or(0);
         self.nodes[i].size = 1 + ls + rs;
         self.nodes[i].size
     }
@@ -442,11 +448,7 @@ mod tests {
             .map(|i| Weight::new(Fraction::new(i, i + 1), 0, vec![0], 1))
             .collect();
         for (i, w) in ids.iter().enumerate() {
-            t.insert(
-                w.clone(),
-                char::from_u32(b'a' as u32 + (i as u32 % 26)).unwrap(),
-                i as u64,
-            );
+            t.insert(w.clone(), char::from_u32(b'a' as u32 + (i as u32 % 26)).unwrap(), i as u64);
         }
         assert_eq!(t.len(), 39);
         for i in (0..39).step_by(2) {
