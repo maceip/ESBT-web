@@ -232,6 +232,20 @@ export interface EsbtDoc {
    * item would occupy today, so ranges collapse instead of drifting.
    */
   anchorToIndex(anchor: EsbtAnchor): number;
+
+  /**
+   * Keyed last-writer-wins map riding the document — same oplog, snapshots,
+   * and version vectors as the text. Contract addition: marks stores comment
+   * records here (the way it used a Loro/Yjs map container), so they sync,
+   * work offline, and survive merges without polluting the markdown.
+   * Values are opaque strings; the highest (lamport, site) write per key
+   * wins on every replica. Deletes leave a mergeable tombstone.
+   */
+  mapSet(key: string, value: string): void;
+  mapDelete(key: string): void;
+  mapGet(key: string): string | undefined;
+  /** Live entries, sorted by key. */
+  mapEntries(): Array<[string, string]>;
 }
 
 export interface EsbtDocStatic {
@@ -246,6 +260,12 @@ export interface UndoManagerOptions {
    * strict contract behaviour of one transact = one step. Marks passes 500.
    */
   mergeIntervalMs?: number;
+  /**
+   * Transacts whose origin starts with any of these prefixes never enter
+   * the undo stack (Loro's `excludeOriginPrefixes`). Marks excludes its
+   * comment writes so Mod-Z never deletes a comment.
+   */
+  excludeOriginPrefixes?: string[];
 }
 
 /**

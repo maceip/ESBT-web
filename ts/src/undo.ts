@@ -24,9 +24,11 @@ export class UndoManager {
     }
     this.doc = impl;
     this.mergeIntervalMs = Math.max(0, options.mergeIntervalMs ?? 0);
+    const excluded = options.excludeOriginPrefixes ?? [];
 
     impl._setUndoHook((ops, origin) => {
       if (origin === 'undo' || origin === 'redo') return;
+      if (origin && excluded.some((prefix) => origin.startsWith(prefix))) return;
       if (ops.length === 0) return;
 
       const now = Date.now();

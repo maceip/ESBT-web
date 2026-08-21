@@ -18,8 +18,12 @@ import { weight } from './weight.js';
  * `unit` is the inserted UTF-16 code unit. On a delete it is populated only
  * for locally generated ops (the undo manager needs the removed unit to
  * reinsert it); it is never encoded on the wire for deletes.
+ *
+ * `map` ops carry the keyed last-writer-wins register writes that ride the
+ * document (marks stores comments there). They have no causal dependencies:
+ * the highest (lamport, site) write for a key wins on every replica.
  */
-export interface Op {
+export interface SeqOp {
   kind: 'ins' | 'del';
   site: SiteId;
   seq: number;
@@ -27,6 +31,18 @@ export interface Op {
   counter: number;
   unit?: number;
 }
+
+export interface MapOp {
+  kind: 'map';
+  site: SiteId;
+  seq: number;
+  key: string;
+  /** null = delete the key. */
+  value: string | null;
+  lamport: number;
+}
+
+export type Op = SeqOp | MapOp;
 
 /** Deletes waiting for their matching insert (ω, c). */
 export class PendingQueue {
@@ -149,8 +165,19 @@ export function readWeight(r: Reader, sites: SiteId[]): Weight {
 
 const OP_INS = 1;
 const OP_DEL = 2;
+const OP_MAP = 3;
 
 export function writeOp(w: Writer, table: SiteTable, op: Op): void {
+  if (op.kind === 'map') {
+    w.u8(OP_MAP);
+    w.uint(table.idOf(op.site));
+    w.uint(op.seq);
+    w.str(op.key);
+    w.u8(op.value === null ? 0 : 1);
+    if (op.value !== null) w.str(op.value);
+    w.uint(op.lamport);
+    return;
+  }
   w.u8(op.kind === 'ins' ? OP_INS : OP_DEL);
   w.uint(table.idOf(op.site));
   w.uint(op.seq);
@@ -165,11 +192,18 @@ export function writeOp(w: Writer, table: SiteTable, op: Op): void {
 
 export function readOp(r: Reader, sites: SiteId[]): Op {
   const tag = r.u8();
-  if (tag !== OP_INS && tag !== OP_DEL) throw new Error('esbt: unknown op tag');
+  if (tag !== OP_INS && tag !== OP_DEL && tag !== OP_MAP) throw new Error('esbt: unknown op tag');
   const siteIdx = r.uint();
   if (siteIdx >= sites.length) throw new Error('esbt: bad site reference');
   const site = sites[siteIdx];
   const seq = r.uint();
+  if (tag === OP_MAP) {
+    const key = r.str();
+    const hasValue = r.u8() !== 0;
+    const value = hasValue ? r.str() : null;
+    const lamport = r.uint();
+    return { kind: 'map', site, seq, key, value, lamport };
+  }
   const w = readWeight(r, sites);
   const counter = r.uint();
   if (tag === OP_INS) {

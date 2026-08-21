@@ -24,6 +24,14 @@ export interface DeletedEntry {
   counter: number;
 }
 
+export interface MapStateEntry {
+  key: string;
+  /** null = tombstone: the key was deleted at this (lamport, site). */
+  value: string | null;
+  lamport: number;
+  site: SiteId;
+}
+
 export interface SnapshotPayload {
   kind: 'snapshot' | 'shallow-snapshot';
   /** Live items in document order. */
@@ -34,6 +42,8 @@ export interface SnapshotPayload {
   version: Map<SiteId, number>;
   /** site → last insertion counter c handed out by that site. */
   counters: Map<SiteId, number>;
+  /** Keyed LWW register state (comments and similar document metadata). */
+  mapState: MapStateEntry[];
   /** Full oplog (empty in a shallow snapshot). */
   ops: Op[];
 }
@@ -105,6 +115,17 @@ export function encodeSnapshot(payload: Omit<SnapshotPayload, 'kind'>, shallow: 
 
   writeSiteMap(body, table, payload.version);
   writeSiteMap(body, table, payload.counters);
+
+  // The LWW map is visible state, so both snapshot flavours carry it —
+  // a cold open must paint comments, not only text.
+  body.uint(payload.mapState.length);
+  for (const entry of payload.mapState) {
+    body.str(entry.key);
+    body.u8(entry.value === null ? 0 : 1);
+    if (entry.value !== null) body.str(entry.value);
+    body.uint(entry.lamport);
+    body.uint(table.idOf(entry.site));
+  }
 
   if (shallow) {
     body.uint(0); // oplog
@@ -183,6 +204,18 @@ export function decodePayload(bytes: Uint8Array): Payload {
   const version = readSiteMap(r, sites);
   const counters = readSiteMap(r, sites);
 
+  const mapCount = r.uint();
+  const mapState: MapStateEntry[] = [];
+  for (let i = 0; i < mapCount; i++) {
+    const key = r.str();
+    const hasValue = r.u8() !== 0;
+    const value = hasValue ? r.str() : null;
+    const lamport = r.uint();
+    const siteIdx = r.uint();
+    if (siteIdx >= sites.length) throw new Error('esbt: bad site reference');
+    mapState.push({ key, value, lamport, site: sites[siteIdx] });
+  }
+
   const opCount = r.uint();
   const ops: Op[] = [];
   for (let i = 0; i < opCount; i++) ops.push(readOp(r, sites));
@@ -193,6 +226,7 @@ export function decodePayload(bytes: Uint8Array): Payload {
     deleteLog,
     version,
     counters,
+    mapState,
     ops,
   };
 }

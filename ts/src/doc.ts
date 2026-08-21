@@ -15,7 +15,7 @@
 
 import type { EsbtAnchor, EsbtConfig, EsbtEvent, EsbtExportOptions } from './api.js';
 import { decodePayload, encodeSnapshot, encodeUpdate, type SnapshotPayload } from './encode.js';
-import { DeleteLog, PendingQueue, type Op } from './ops.js';
+import { DeleteLog, PendingQueue, type Op, type SeqOp } from './ops.js';
 import { DocSeq, type Item } from './tree.js';
 import { VersionVector } from './vector.js';
 import {
@@ -61,6 +61,12 @@ export class EsbtDoc {
   private readonly log = new Map<SiteId, Map<number, Op>>();
   /** site → last insertion counter c that site handed out. */
   private readonly counters = new Map<SiteId, number>();
+  /** Keyed LWW registers riding the document (comments and similar). */
+  private readonly mapState = new Map<
+    string,
+    { value: string | null; lamport: number; site: SiteId }
+  >();
+  private maxLamport = 0;
 
   private counter = 0;
   private localSeq = 0;
@@ -251,6 +257,68 @@ export class EsbtDoc {
     return op;
   }
 
+  /* ------------------------------------------------------------ LWW map */
+
+  /**
+   * Set a key in the document's keyed last-writer-wins map. The map rides
+   * the same oplog, snapshots, and version vectors as the text — marks
+   * stores comment records here so they sync, work offline, and survive a
+   * merge, without ever being encoded as characters in the markdown.
+   */
+  mapSet(key: string, value: string): void {
+    this.transact(() => this.mapWrite(key, value));
+  }
+
+  /** Delete a key (a tombstone with the write's clock survives for merging). */
+  mapDelete(key: string): void {
+    this.transact(() => this.mapWrite(key, null));
+  }
+
+  mapGet(key: string): string | undefined {
+    const entry = this.mapState.get(key);
+    return entry && entry.value !== null ? entry.value : undefined;
+  }
+
+  /** Live entries, sorted by key. */
+  mapEntries(): Array<[string, string]> {
+    const out: Array<[string, string]> = [];
+    for (const [key, entry] of this.mapState) {
+      if (entry.value !== null) out.push([key, entry.value]);
+    }
+    out.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+    return out;
+  }
+
+  private mapWrite(key: string, value: string | null): void {
+    this.maxLamport += 1;
+    const op: Op = {
+      kind: 'map',
+      site: this.siteId,
+      seq: this.stamp(),
+      key,
+      value,
+      lamport: this.maxLamport,
+    };
+    this.logAdd(op);
+    this.applyMap(key, value, op.lamport, op.site);
+    this.txOps.push(op);
+  }
+
+  /** Highest (lamport, site) wins; replays and stale writes are no-ops. */
+  private applyMap(key: string, value: string | null, lamport: number, site: SiteId): boolean {
+    if (lamport > this.maxLamport) this.maxLamport = lamport;
+    const existing = this.mapState.get(key);
+    if (
+      existing &&
+      (existing.lamport > lamport || (existing.lamport === lamport && existing.site >= site))
+    ) {
+      return false;
+    }
+    this.mapState.set(key, { value, lamport, site });
+    this.mutations += 1;
+    return true;
+  }
+
   private stamp(): number {
     this.localSeq += 1;
     this.vvNote(this.siteId, this.localSeq);
@@ -259,7 +327,7 @@ export class EsbtDoc {
 
   /* --------------------------------------------------------- application */
 
-  private applyIns(op: Op): boolean {
+  private applyIns(op: SeqOp): boolean {
     if (this.deleteLog.has(op.weight, op.counter)) return false;
     const index = this.seq.insert({ weight: op.weight, unit: op.unit ?? 0, counter: op.counter });
     if (index < 0) return false;
@@ -307,6 +375,7 @@ export class EsbtDoc {
     if (op.site === this.siteId) {
       this.localSeq = Math.max(this.localSeq, op.seq);
       if (op.kind === 'ins') this.counter = Math.max(this.counter, op.counter);
+      if (op.kind === 'map') this.maxLamport = Math.max(this.maxLamport, op.lamport);
     }
 
     const before = this.mutations;
@@ -321,6 +390,10 @@ export class EsbtDoc {
 
   /** One attempt at a buffered op. True = consumed (applied or discarded). */
   private step(op: Op): boolean {
+    if (op.kind === 'map') {
+      this.applyMap(op.key, op.value, op.lamport, op.site);
+      return true; // LWW: always ready, stale writes are discarded
+    }
     if (op.kind === 'ins') {
       this.applyIns(op);
       return true; // insertions are always ready; duplicates are discarded
@@ -353,6 +426,7 @@ export class EsbtDoc {
             deleteLog: this.deleteLog.values(),
             version: new Map(this.vv),
             counters: new Map(this.counters),
+            mapState: this.mapStateEntries(),
             ops: this.allOps(),
           },
           false,
@@ -364,6 +438,7 @@ export class EsbtDoc {
             deleteLog: [],
             version: new Map(this.vv),
             counters: new Map(this.counters),
+            mapState: this.mapStateEntries(),
             ops: [],
           },
           true,
@@ -403,6 +478,19 @@ export class EsbtDoc {
       }
     }
     return ops;
+  }
+
+  private mapStateEntries(): Array<{
+    key: string;
+    value: string | null;
+    lamport: number;
+    site: SiteId;
+  }> {
+    const out = [];
+    for (const [key, entry] of this.mapState) {
+      out.push({ key, value: entry.value, lamport: entry.lamport, site: entry.site });
+    }
+    return out;
   }
 
   import(bytes: Uint8Array): void {
@@ -459,11 +547,14 @@ export class EsbtDoc {
       }
     }
 
-    // 3. Clocks.
+    // 3. Clocks and the LWW map.
     for (const [site, seq] of payload.version) this.vvNote(site, seq);
     for (const [site, c] of payload.counters) {
       const seen = this.counters.get(site) ?? 0;
       if (c > seen) this.counters.set(site, c);
+    }
+    for (const entry of payload.mapState) {
+      this.applyMap(entry.key, entry.value, entry.lamport, entry.site);
     }
 
     // 4. Oplog union, replaying only ops whose effect is not yet visible —
@@ -473,9 +564,11 @@ export class EsbtDoc {
       if (this.logHas(op.site, op.seq)) continue;
       this.logAdd(op);
       const applied =
-        op.kind === 'ins'
-          ? this.deleteLog.has(op.weight, op.counter) || this.seq.has(op.weight)
-          : this.deleteLog.has(op.weight, op.counter);
+        op.kind === 'map'
+          ? true // the map section above is authoritative for logged writes
+          : op.kind === 'ins'
+            ? this.deleteLog.has(op.weight, op.counter) || this.seq.has(op.weight)
+            : this.deleteLog.has(op.weight, op.counter);
       if (!applied) this.pending.push(op);
     }
 
@@ -560,6 +653,7 @@ export class EsbtDoc {
     const inverse: Op[] = [];
     this.transact(() => {
       for (const op of batch) {
+        if (op.kind === 'map') continue; // map writes are not undoable
         if (op.kind === 'ins') {
           const live = this.seq.find(op.weight);
           if (!live || live.counter !== op.counter) continue;

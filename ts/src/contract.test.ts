@@ -643,6 +643,108 @@ test('EphemeralStore: entries expire after ttlMs and subscribers hear about it',
   store.destroy();
 });
 
+/* ------------------------------------------------------------ LWW map */
+
+test('map: set/get/delete/entries, syncs over updates, rides snapshots', () => {
+  const a = new EsbtDoc({ siteId: 'a' });
+  const b = new EsbtDoc({ siteId: 'b' });
+  const unwire = wire(a, b);
+
+  a.mapSet('c_1', '{"body":"first comment"}');
+  a.mapSet('c_2', '{"body":"second"}');
+  assert.equal(a.mapGet('c_1'), '{"body":"first comment"}');
+  assert.deepEqual(
+    a.mapEntries(),
+    [
+      ['c_1', '{"body":"first comment"}'],
+      ['c_2', '{"body":"second"}'],
+    ],
+  );
+  assert.deepEqual(b.mapEntries(), a.mapEntries());
+
+  a.mapDelete('c_1');
+  assert.equal(a.mapGet('c_1'), undefined);
+  assert.deepEqual(b.mapEntries(), [['c_2', '{"body":"second"}']]);
+  unwire();
+
+  // Snapshots (both flavours) carry the map: a cold open paints comments.
+  const fresh = new EsbtDoc();
+  fresh.import(a.export({ mode: 'snapshot' }));
+  assert.deepEqual(fresh.mapEntries(), a.mapEntries());
+  const shallow = new EsbtDoc();
+  shallow.import(a.export({ mode: 'shallow-snapshot' }));
+  assert.deepEqual(shallow.mapEntries(), a.mapEntries());
+
+  // The tombstone must merge: a replica that only saw the set drops the key.
+  const late = new EsbtDoc({ siteId: 'late' });
+  late.import(a.export({ mode: 'snapshot' }));
+  assert.equal(late.mapGet('c_1'), undefined);
+});
+
+test('map: concurrent writes to one key converge on the same winner', () => {
+  const a = new EsbtDoc({ siteId: 'aaa' });
+  const b = new EsbtDoc({ siteId: 'bbb' });
+  const fromA: Uint8Array[] = [];
+  const fromB: Uint8Array[] = [];
+  a.subscribeLocalUpdates((u) => fromA.push(u));
+  b.subscribeLocalUpdates((u) => fromB.push(u));
+
+  a.mapSet('k', 'from-a');
+  b.mapSet('k', 'from-b');
+  for (const u of fromB) a.import(u);
+  for (const u of fromA) b.import(u);
+
+  assert.equal(a.mapGet('k'), b.mapGet('k'));
+
+  // A later write beats both, in either delivery order.
+  const fromA2: Uint8Array[] = [];
+  a.subscribeLocalUpdates((u) => fromA2.push(u));
+  a.mapSet('k', 'settled');
+  for (const u of fromA2) b.import(u);
+  assert.equal(a.mapGet('k'), 'settled');
+  assert.equal(b.mapGet('k'), 'settled');
+});
+
+test('map: writes fire subscribe, ride local updates, and offline deltas include them', () => {
+  const a = new EsbtDoc({ siteId: 'a' });
+  const b = new EsbtDoc({ siteId: 'b' });
+  b.import(a.export({ mode: 'update' }));
+
+  const events: string[] = [];
+  b.subscribe((event) => events.push(event.origin ?? 'remote'));
+
+  a.transact(() => a.mapSet('c', 'v1'), 'comments');
+  b.import(a.export({ mode: 'update', from: b.oplogVersion() }));
+  assert.equal(events.length, 1);
+  assert.equal(b.mapGet('c'), 'v1');
+
+  // Idempotent: replaying everything from birth changes nothing, silently.
+  b.import(a.export({ mode: 'update' }));
+  assert.equal(events.length, 1);
+});
+
+test('map writes never enter the undo stack', () => {
+  const doc = new EsbtDoc();
+  const undo = new UndoManager(doc, { excludeOriginPrefixes: ['comments'] });
+
+  doc.transact(() => doc.insert(0, 'text'), 'editor');
+  doc.transact(() => doc.mapSet('c_1', 'a comment'), 'comments');
+
+  undo.undo();
+  assert.equal(doc.getText(), '');
+  assert.equal(doc.mapGet('c_1'), 'a comment'); // the comment survives Mod-Z
+
+  // Even in a mixed batch, undo skips map ops.
+  doc.transact(() => {
+    doc.insert(0, 'more');
+    doc.mapSet('c_2', 'inline');
+  }, 'editor');
+  undo.undo();
+  assert.equal(doc.getText(), '');
+  assert.equal(doc.mapGet('c_2'), 'inline');
+  undo.destroy();
+});
+
 /* ----------------------------------------------------- degenerate gaps */
 
 test('inserting between concurrent same-gap twins never drops or misplaces beyond the pair', () => {
