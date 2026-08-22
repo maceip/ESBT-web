@@ -4,7 +4,11 @@ use crate::fraction::Fraction;
 use core::cmp::Ordering;
 use core::fmt;
 
-pub type SiteId = u32;
+/// Collision-resistant replica identity.
+///
+/// Product identity is intentionally outside the CRDT. This random 128-bit
+/// value only separates independently minted ESBT operation streams.
+pub type SiteId = u128;
 
 /// W = ⟨f, sn, sc, δ⟩. Sentinels use δ = ∅ encoded as 0.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -79,11 +83,7 @@ impl Ord for Weight {
 
 impl fmt::Display for Weight {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "⟨{},{},{:?},δ{}⟩",
-            self.f, self.sn, self.sc, self.site
-        )
+        write!(f, "⟨{},{},{:?},δ{}⟩", self.f, self.sn, self.sc, self.site)
     }
 }
 

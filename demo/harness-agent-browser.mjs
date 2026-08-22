@@ -77,12 +77,8 @@ export async function launchAgentBrowser(url) {
     async state() {
       const raw = await run([
         "eval",
-        "JSON.stringify({text:window.__esbtDemo.text(),hash:window.__esbtDemo.hash(),len:window.__esbtDemo.len(),pending:window.__esbtDemo.pending(),site:window.__esbtDemo.site})",
+        "JSON.stringify({text:window.__esbtDemo.text(),hash:window.__esbtDemo.hash(),len:window.__esbtDemo.len(),pending:window.__esbtDemo.pending(),site:window.__esbtDemo.site,diagnostics:window.__esbtDemo.diagnostics()})",
       ]);
-      return unwrap(raw);
-    },
-    async verify() {
-      const raw = await run(["eval", "JSON.stringify(window.__esbtDemo.verify())"]);
       return unwrap(raw);
     },
     async close() {

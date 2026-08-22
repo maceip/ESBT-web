@@ -11,7 +11,7 @@ enum Color {
 #[derive(Clone)]
 struct Node {
     weight: Weight,
-    ch: char,
+    unit: u16,
     counter: u64,
     color: Color,
     left: Option<usize>,
@@ -30,6 +30,10 @@ pub struct DocTree {
 impl DocTree {
     pub fn len(&self) -> usize {
         self.root.map(|r| self.nodes[r].size).unwrap_or(0)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     fn alloc(&mut self, n: Node) -> usize {
@@ -93,13 +97,13 @@ impl DocTree {
         self.pull(y);
     }
 
-    pub fn insert(&mut self, weight: Weight, ch: char, counter: u64) -> bool {
+    pub fn insert(&mut self, weight: Weight, unit: u16, counter: u64) -> bool {
         if self.find(&weight).is_some() {
             return false;
         }
         let z = self.alloc(Node {
             weight,
-            ch,
+            unit,
             counter,
             color: Color::Red,
             left: None,
@@ -187,14 +191,14 @@ impl DocTree {
         }
     }
 
-    pub fn find(&self, w: &Weight) -> Option<(char, u64)> {
+    pub fn find(&self, w: &Weight) -> Option<(u16, u64)> {
         let mut x = self.root;
         while let Some(xi) = x {
             match w.cmp(&self.nodes[xi].weight) {
                 core::cmp::Ordering::Less => x = self.nodes[xi].left,
                 core::cmp::Ordering::Greater => x = self.nodes[xi].right,
                 core::cmp::Ordering::Equal => {
-                    return Some((self.nodes[xi].ch, self.nodes[xi].counter))
+                    return Some((self.nodes[xi].unit, self.nodes[xi].counter))
                 }
             }
         }
@@ -205,7 +209,7 @@ impl DocTree {
         self.find(w).is_some()
     }
 
-    pub fn get_at(&self, mut index: usize) -> Option<(&Weight, char, u64)> {
+    pub fn get_at(&self, mut index: usize) -> Option<(&Weight, u16, u64)> {
         let mut x = self.root?;
         loop {
             let ls = self.sz(self.nodes[x].left);
@@ -213,12 +217,49 @@ impl DocTree {
                 x = self.nodes[x].left?;
             } else if index == ls {
                 let n = &self.nodes[x];
-                return Some((&n.weight, n.ch, n.counter));
+                return Some((&n.weight, n.unit, n.counter));
             } else {
                 index -= ls + 1;
                 x = self.nodes[x].right?;
             }
         }
+    }
+
+    /// Rank of an exact live weight.
+    pub fn index_of(&self, weight: &Weight) -> Option<usize> {
+        let mut node = self.root;
+        let mut before = 0usize;
+        while let Some(index) = node {
+            let left_size = self.sz(self.nodes[index].left);
+            match weight.cmp(&self.nodes[index].weight) {
+                core::cmp::Ordering::Less => node = self.nodes[index].left,
+                core::cmp::Ordering::Greater => {
+                    before = before.saturating_add(left_size).saturating_add(1);
+                    node = self.nodes[index].right;
+                }
+                core::cmp::Ordering::Equal => return Some(before.saturating_add(left_size)),
+            }
+        }
+        None
+    }
+
+    /// Rank where `weight` is or would be inserted. This remains meaningful
+    /// after that weight is deleted and is the basis of stable anchors.
+    pub fn lower_bound(&self, weight: &Weight) -> usize {
+        let mut node = self.root;
+        let mut before = 0usize;
+        let mut result = self.len();
+        while let Some(index) = node {
+            let left_size = self.sz(self.nodes[index].left);
+            if self.nodes[index].weight < *weight {
+                before = before.saturating_add(left_size).saturating_add(1);
+                node = self.nodes[index].right;
+            } else {
+                result = before.saturating_add(left_size);
+                node = self.nodes[index].left;
+            }
+        }
+        result
     }
 
     pub fn delete(&mut self, w: &Weight) -> bool {
@@ -254,82 +295,94 @@ impl DocTree {
         x
     }
 
+    fn pull_upward(&mut self, mut node: Option<usize>) {
+        while let Some(index) = node {
+            self.pull(index);
+            node = self.nodes[index].parent;
+        }
+    }
+
     fn delete_idx(&mut self, z: usize) {
         let mut y = z;
-        let y_orig = self.nodes[y].color;
+        let mut removed_color = self.nodes[y].color;
         let x;
-        let mut xp = self.nodes[z].parent;
+        let x_parent;
+        let x_was_left;
 
         if self.nodes[z].left.is_none() {
             x = self.nodes[z].right;
+            x_parent = self.nodes[z].parent;
+            x_was_left = x_parent.is_some_and(|parent| self.nodes[parent].left == Some(z));
             self.transplant(z, x);
+            self.pull_upward(x_parent);
         } else if self.nodes[z].right.is_none() {
             x = self.nodes[z].left;
+            x_parent = self.nodes[z].parent;
+            x_was_left = x_parent.is_some_and(|parent| self.nodes[parent].left == Some(z));
             self.transplant(z, x);
+            self.pull_upward(x_parent);
         } else {
             y = self.minimum(self.nodes[z].right.unwrap());
-            let y_color = self.nodes[y].color;
+            removed_color = self.nodes[y].color;
             x = self.nodes[y].right;
             if self.nodes[y].parent == Some(z) {
-                xp = Some(y);
+                x_parent = Some(y);
+                x_was_left = false;
                 if let Some(xi) = x {
                     self.nodes[xi].parent = Some(y);
                 }
             } else {
-                xp = self.nodes[y].parent;
+                let old_parent = self.nodes[y].parent.expect("successor parent");
+                x_parent = Some(old_parent);
+                // A non-immediate in-order successor is the left child of its
+                // old parent. Retain that side explicitly because a missing
+                // child has no node from which delete fix-up can recover it.
+                x_was_left = true;
                 self.transplant(y, x);
+                self.pull_upward(Some(old_parent));
                 self.nodes[y].right = self.nodes[z].right;
                 if let Some(r) = self.nodes[y].right {
                     self.nodes[r].parent = Some(y);
                 }
             }
+            let z_parent = self.nodes[z].parent;
             self.transplant(z, Some(y));
             self.nodes[y].left = self.nodes[z].left;
             if let Some(l) = self.nodes[y].left {
                 self.nodes[l].parent = Some(y);
             }
             self.nodes[y].color = self.nodes[z].color;
-            let _ = y_color;
+            self.pull(y);
+            self.pull_upward(z_parent);
         }
 
-        let mut p = xp.or(x.and_then(|xi| self.nodes[xi].parent));
-        if p.is_none() {
-            p = self.root;
-        }
-        while let Some(pi) = p {
-            self.pull(pi);
-            p = self.nodes[pi].parent;
-        }
-        if let Some(r) = self.root {
-            self.recompute(r);
-        }
-
-        if y_orig == Color::Black {
-            self.delete_fix(x);
+        if removed_color == Color::Black {
+            self.delete_fix(x, x_parent, x_was_left);
         }
         self.free.push(z);
     }
 
-    fn recompute(&mut self, i: usize) -> usize {
-        let ls = self.nodes[i]
-            .left
-            .map(|l| self.recompute(l))
-            .unwrap_or(0);
-        let rs = self.nodes[i]
-            .right
-            .map(|r| self.recompute(r))
-            .unwrap_or(0);
-        self.nodes[i].size = 1 + ls + rs;
-        self.nodes[i].size
-    }
-
-    fn delete_fix(&mut self, mut x: Option<usize>) {
+    fn delete_fix(
+        &mut self,
+        mut x: Option<usize>,
+        missing_parent: Option<usize>,
+        missing_was_left: bool,
+    ) {
         while x != self.root && self.color(x) == Color::Black {
-            let p = match x.and_then(|xi| self.nodes[xi].parent).or(self.root) {
-                Some(p) => p,
-                None => break,
+            let (p, is_left) = match x {
+                Some(index) => {
+                    let Some(parent) = self.nodes[index].parent else {
+                        break;
+                    };
+                    (parent, self.nodes[parent].left == Some(index))
+                }
+                None => {
+                    let Some(parent) = missing_parent else {
+                        break;
+                    };
+                    (parent, missing_was_left)
+                }
             };
-            let is_left = x == self.nodes[p].left || (x.is_none() && self.nodes[p].left.is_none());
             if is_left {
                 let mut w = self.nodes[p].right;
                 if self.color(w) == Color::Red {
@@ -414,15 +467,24 @@ impl DocTree {
     }
 
     pub fn text(&self) -> String {
-        let mut s = String::with_capacity(self.len());
-        self.walk(self.root, &mut |n| s.push(n.ch));
-        s
+        String::from_utf16_lossy(&self.units())
     }
 
-    pub fn atoms(&self) -> Vec<(Weight, char, u64)> {
+    /// Visible document elements in CodeMirror's native index space.
+    ///
+    /// JavaScript strings and CodeMirror positions count UTF-16 code units,
+    /// not Unicode scalar values. Keeping one unit per tree item avoids an
+    /// O(document length) offset translation on every browser edit.
+    pub fn units(&self) -> Vec<u16> {
+        let mut out = Vec::with_capacity(self.len());
+        self.walk(self.root, &mut |n| out.push(n.unit));
+        out
+    }
+
+    pub fn atoms(&self) -> Vec<(Weight, u16, u64)> {
         let mut out = Vec::with_capacity(self.len());
         self.walk(self.root, &mut |n| {
-            out.push((n.weight.clone(), n.ch, n.counter))
+            out.push((n.weight.clone(), n.unit, n.counter))
         });
         out
     }
@@ -448,17 +510,33 @@ mod tests {
             .map(|i| Weight::new(Fraction::new(i, i + 1), 0, vec![0], 1))
             .collect();
         for (i, w) in ids.iter().enumerate() {
-            t.insert(w.clone(), char::from_u32(b'a' as u32 + (i as u32 % 26)).unwrap(), i as u64);
+            t.insert(w.clone(), u16::from(b'a' + (i as u8 % 26)), i as u64);
         }
         assert_eq!(t.len(), 39);
         for i in (0..39).step_by(2) {
             t.delete(&ids[i]);
         }
         let text = t.text();
-        assert_eq!(text.chars().count(), t.len());
+        assert_eq!(text.encode_utf16().count(), t.len());
         let atoms = t.atoms();
         for w in atoms.windows(2) {
             assert!(w[0].0 < w[1].0);
         }
+    }
+
+    #[test]
+    fn rank_and_lower_bound_survive_deletion() {
+        let mut tree = DocTree::default();
+        let weights: Vec<_> = (1..=5)
+            .map(|i| Weight::new(Fraction::new(i, 6), 0, vec![0], 1))
+            .collect();
+        for (index, weight) in weights.iter().enumerate() {
+            assert!(tree.insert(weight.clone(), b'a' as u16 + index as u16, 1));
+        }
+        assert_eq!(tree.index_of(&weights[2]), Some(2));
+        assert_eq!(tree.lower_bound(&weights[2]), 2);
+        assert!(tree.delete(&weights[2]));
+        assert_eq!(tree.index_of(&weights[2]), None);
+        assert_eq!(tree.lower_bound(&weights[2]), 2);
     }
 }

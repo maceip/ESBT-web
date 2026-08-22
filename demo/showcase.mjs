@@ -78,12 +78,6 @@ async function main() {
     ]);
     console.log("sites:", (await Promise.all(users.map((u) => u.state()))).map((s) => `${s.site}@${s.hash}`).join("  "));
 
-    await scenario("paper Situations 1–3 + Alg. 3 + SEC", async () => {
-      const { rc, log } = await users[0].verify();
-      if (rc <= 0) throw new Error(log);
-      ok("in-kernel paper suite", `rc=${rc}`);
-    });
-
     await scenario("empty start converges", async () => {
       const s = await waitConverged(users);
       if (s[0].text !== "") throw new Error("expected empty");

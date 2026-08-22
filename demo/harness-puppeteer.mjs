@@ -28,10 +28,8 @@ export async function launchPuppeteer(url) {
         len: window.__esbtDemo.len(),
         pending: window.__esbtDemo.pending(),
         site: window.__esbtDemo.site,
+        diagnostics: window.__esbtDemo.diagnostics(),
       }));
-    },
-    async verify() {
-      return page.evaluate(() => window.__esbtDemo.verify());
     },
     async close() {
       await browser.close();

@@ -24,15 +24,19 @@ pub fn run_all() -> (u32, u32, String) {
         let mut a = Allocator::new(5, 10, 3);
         let w1 = Weight::new(Fraction::new(1, 4), 0, vec![0], 1);
         let w2 = Weight::new(Fraction::new(2, 3), 0, vec![0], 1);
-        let r1 = a.create_weight(&w1, &w2, 1);
+        let r1 = a.create_weight(&w1, &w2, 1).expect("S1 allocation");
         check(
             "S1/S2 first right sn=1 at 1/4",
             r1.f == Fraction::new(1, 4) && r1.sn == 1,
             &r1.to_string(),
         );
-        let r2 = a.create_weight(&r1, &w2, 1);
-        let l1 = a.create_weight(&Weight::begin(), &w1, 1);
-        let l2 = a.create_weight(&Weight::begin(), &l1, 1);
+        let r2 = a.create_weight(&r1, &w2, 1).expect("S2 right");
+        let l1 = a
+            .create_weight(&Weight::begin(), &w1, 1)
+            .expect("S2 left 1");
+        let l2 = a
+            .create_weight(&Weight::begin(), &l1, 1)
+            .expect("S2 left 2");
         check(
             "S2 ladder -2..2",
             l2.sn == -2 && l1.sn == -1 && r2.sn == 2 && l2 < l1 && l1 < w1 && w1 < r1 && r1 < r2,
@@ -43,8 +47,12 @@ pub fn run_all() -> (u32, u32, String) {
         let mut a = Allocator::new(5, 10, 3);
         let w0 = Weight::new(Fraction::new(1, 4), 0, vec![0], 1);
         let w1 = Weight::new(Fraction::new(1, 4), 1, vec![0], 1);
-        let mid = a.create_weight(&w0, &w1, 2);
-        check("S3 NEWSEQ between sn 0 and 1", w0 < mid && mid < w1, &mid.to_string());
+        let mid = a.create_weight(&w0, &w1, 2).expect("S3 allocation");
+        check(
+            "S3 NEWSEQ between sn 0 and 1",
+            w0 < mid && mid < w1,
+            &mid.to_string(),
+        );
     }
     check("NEWSEQ ex1", newseq(&[3], &[7], 10, 3, 2) == vec![5], "");
     check("NEWSEQ ex2", newseq(&[3], &[4], 10, 3, 2) == vec![3, 5], "");
@@ -53,8 +61,12 @@ pub fn run_all() -> (u32, u32, String) {
         let mut a = Allocator::new(10, 10, 3);
         let w1 = Weight::new(Fraction::new(1, 3), 0, vec![0], 1);
         let w2 = Weight::new(Fraction::new(1, 2), 0, vec![0], 1);
-        let w = a.create_weight(&w1, &w2, 1);
-        check("paper 2/5 mediant", w.f == Fraction::new(2, 5) && w.sn == 0, "");
+        let w = a.create_weight(&w1, &w2, 1).expect("mediant allocation");
+        check(
+            "paper 2/5 mediant",
+            w.f == Fraction::new(2, 5) && w.sn == 0,
+            "",
+        );
     }
 
     let cfg = ReplicaConfig {
@@ -65,7 +77,7 @@ pub fn run_all() -> (u32, u32, String) {
     {
         let mut a = Replica::new(1, cfg.clone());
         let mut b = Replica::new(2, cfg.clone());
-        let ins = a.local_insert(0, 'A');
+        let ins = a.local_insert(0, 'A' as u16);
         let del = a.local_delete(0).unwrap();
         b.receive(del);
         let waited = b.pending.len() == 1;
@@ -79,9 +91,9 @@ pub fn run_all() -> (u32, u32, String) {
     {
         let mut a = Replica::new(1, cfg.clone());
         let mut b = Replica::new(2, cfg.clone());
-        let i1 = a.local_insert(0, 'A');
+        let i1 = a.local_insert(0, 'A' as u16);
         let d1 = a.local_delete(0).unwrap();
-        let i2 = a.local_insert(0, 'B');
+        let i2 = a.local_insert(0, 'B' as u16);
         b.receive(i2);
         b.receive(d1);
         b.receive(i1);
@@ -95,12 +107,12 @@ pub fn run_all() -> (u32, u32, String) {
         let mut a = Replica::new(1, ReplicaConfig::default());
         let mut b = Replica::new(2, ReplicaConfig::default());
         let mut c = Replica::new(3, ReplicaConfig::default());
-        let s = a.local_insert(0, '·');
+        let s = a.local_insert(0, '·' as u16);
         b.receive(s.clone());
         c.receive(s);
-        let ia = a.local_insert(0, 'A');
-        let ib = b.local_insert(1, 'B');
-        let ic = c.local_insert(1, 'C');
+        let ia = a.local_insert(0, 'A' as u16);
+        let ib = b.local_insert(1, 'B' as u16);
+        let ic = c.local_insert(1, 'C' as u16);
         for r in [&mut a, &mut b, &mut c] {
             r.receive(ia.clone());
             r.receive(ib.clone());
@@ -118,7 +130,11 @@ pub fn run_all() -> (u32, u32, String) {
         a.local_delete_range(1, 2);
         let mut j = Replica::new(9, cfg);
         j.install_snapshot(&a.snapshot());
-        check("late join snapshot", j.text() == a.text() && j.text() == "Hlo", "");
+        check(
+            "late join snapshot",
+            j.text() == a.text() && j.text() == "Hlo",
+            "",
+        );
     }
 
     (pass, fail, log)

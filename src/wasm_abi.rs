@@ -1,25 +1,49 @@
-//! C ABI used by the editor page.
+//! Production opaque-document Wasm C ABI.
 
-use crate::op::Op;
-use crate::replica::{Replica, ReplicaConfig};
-use crate::snapshot::{Message, Snapshot};
-use crate::verify;
+use crate::anchor::{Affinity, Anchor};
+use crate::clock::Version;
+use crate::document::{Document, LocalUpdate, SnapshotKind, SnapshotReceipt, UndoDisposition};
+use crate::error::{EngineError, ErrorCode};
 use std::cell::RefCell;
+use std::collections::HashMap;
 
-const MAX: usize = 64;
-
-struct Session {
-    cfg: ReplicaConfig,
-    replicas: Vec<Option<Replica>>,
-}
+const MAX_DOCUMENTS: usize = 1_024;
+const MAX_ABI_ALLOCATION: usize = 16 * 1024 * 1024;
 
 thread_local! {
-    static SESSION: RefCell<Option<Session>> = RefCell::new(None);
     static LAST: RefCell<Vec<u8>> = RefCell::new(Vec::new());
+    static LAST_ERROR: RefCell<u32> = const { RefCell::new(0) };
+    static ALLOCATIONS: RefCell<HashMap<usize, (usize, usize)>> = RefCell::new(HashMap::new());
+    static DOCUMENTS: RefCell<DocumentStore> = RefCell::new(DocumentStore::default());
 }
 
-fn with<R>(f: impl FnOnce(&mut Session) -> R) -> Option<R> {
-    SESSION.with(|s| s.borrow_mut().as_mut().map(f))
+#[derive(Default)]
+struct DocumentStore {
+    next_handle: u32,
+    documents: HashMap<u32, Document>,
+}
+
+impl DocumentStore {
+    fn insert(&mut self, document: Document) -> Result<u32, EngineError> {
+        if self.documents.len() >= MAX_DOCUMENTS {
+            return Err(EngineError::new(
+                ErrorCode::InvalidHandle,
+                "Wasm document handle limit reached",
+            ));
+        }
+        for _ in 0..=MAX_DOCUMENTS {
+            self.next_handle = self.next_handle.wrapping_add(1).max(1);
+            if !self.documents.contains_key(&self.next_handle) {
+                let handle = self.next_handle;
+                self.documents.insert(handle, document);
+                return Ok(handle);
+            }
+        }
+        Err(EngineError::new(
+            ErrorCode::InvalidHandle,
+            "no free Wasm document handle",
+        ))
+    }
 }
 
 fn store(b: Vec<u8>) -> i32 {
@@ -30,26 +54,169 @@ fn store(b: Vec<u8>) -> i32 {
     })
 }
 
-fn store_str(s: &str) -> i32 {
-    store(s.as_bytes().to_vec())
+fn clear_error() {
+    LAST_ERROR.with(|code| *code.borrow_mut() = 0);
 }
 
-fn replica<R>(site: u32, f: impl FnOnce(&mut Replica) -> R) -> Option<R> {
-    with(|s| s.replicas.get_mut(site as usize).and_then(|r| r.as_mut().map(f))).flatten()
+fn fail(error: EngineError) -> i32 {
+    LAST_ERROR.with(|code| *code.borrow_mut() = error.code as u32);
+    store(error.to_string().into_bytes());
+    -(error.code as i32)
+}
+
+fn invalid_handle() -> EngineError {
+    EngineError::new(ErrorCode::InvalidHandle, "unknown document handle")
+}
+
+fn with_document<R>(
+    handle: u32,
+    operation: impl FnOnce(&mut Document) -> Result<R, EngineError>,
+) -> Result<R, EngineError> {
+    DOCUMENTS.with(|documents| {
+        let mut documents = documents.borrow_mut();
+        let document = documents
+            .documents
+            .get_mut(&handle)
+            .ok_or_else(invalid_handle)?;
+        operation(document)
+    })
+}
+
+fn site_from_words(words: [u32; 4]) -> u128 {
+    u128::from(words[0])
+        | (u128::from(words[1]) << 32)
+        | (u128::from(words[2]) << 64)
+        | (u128::from(words[3]) << 96)
+}
+
+fn group_from_words(has_group: u32, low: u32, high: u32) -> Option<u64> {
+    (has_group != 0).then_some(u64::from(low) | (u64::from(high) << 32))
+}
+
+fn read_input(pointer: *const u8, length: u32) -> Result<Vec<u8>, EngineError> {
+    let length = length as usize;
+    if length > MAX_ABI_ALLOCATION {
+        return Err(EngineError::new(
+            ErrorCode::MessageTooLarge,
+            "ABI input exceeds allocation policy",
+        ));
+    }
+    if length == 0 {
+        return Ok(Vec::new());
+    }
+    if pointer.is_null() {
+        return Err(EngineError::malformed("null ABI input pointer"));
+    }
+    let start = pointer as usize;
+    let end = start.checked_add(length).ok_or_else(|| {
+        EngineError::new(ErrorCode::IntegerOverflow, "ABI pointer range overflow")
+    })?;
+    let memory_bytes = core::arch::wasm32::memory_size::<0>()
+        .checked_mul(65_536)
+        .ok_or_else(|| EngineError::new(ErrorCode::IntegerOverflow, "Wasm memory overflow"))?;
+    if end > memory_bytes {
+        return Err(EngineError::malformed(
+            "ABI input range is outside Wasm memory",
+        ));
+    }
+    // The range is within the module's linear memory. Copy before any call
+    // that might grow memory and invalidate a borrowed view.
+    Ok(unsafe { std::slice::from_raw_parts(pointer, length) }.to_vec())
+}
+
+fn decode_utf16(bytes: &[u8]) -> Result<Vec<u16>, EngineError> {
+    if !bytes.len().is_multiple_of(2) {
+        return Err(EngineError::malformed(
+            "UTF-16 input has an odd byte length",
+        ));
+    }
+    Ok(bytes
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect())
+}
+
+fn encode_utf16(units: &[u16]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(units.len().saturating_mul(2));
+    for unit in units {
+        out.extend_from_slice(&unit.to_le_bytes());
+    }
+    out
+}
+
+fn store_local_update(update: Option<LocalUpdate>) -> i32 {
+    clear_error();
+    match update {
+        Some(update) => {
+            store(update.canonical_bytes);
+            1
+        }
+        None => {
+            store(Vec::new());
+            0
+        }
+    }
+}
+
+fn encode_snapshot_receipt(receipt: &SnapshotReceipt) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.push(match receipt.kind {
+        SnapshotKind::Full => 1,
+        SnapshotKind::Compact => 2,
+    });
+    out.push(u8::from(receipt.visible_changed));
+    out.push(match receipt.undo {
+        UndoDisposition::Preserved => 1,
+        UndoDisposition::Cleared => 2,
+        UndoDisposition::PartiallyPreserved => 3,
+    });
+    let version = receipt.version.encode();
+    out.extend_from_slice(&(version.len() as u32).to_le_bytes());
+    out.extend_from_slice(&version);
+    out
 }
 
 #[no_mangle]
 pub extern "C" fn esbt_malloc(n: u32) -> *mut u8 {
-    let mut v = vec![0u8; n as usize];
+    let length = n as usize;
+    if length == 0 || length > MAX_ABI_ALLOCATION {
+        return core::ptr::null_mut();
+    }
+    let mut v = Vec::new();
+    if v.try_reserve_exact(length).is_err() {
+        return core::ptr::null_mut();
+    }
+    v.resize(length, 0u8);
     let p = v.as_mut_ptr();
+    let capacity = v.capacity();
     std::mem::forget(v);
+    ALLOCATIONS.with(|allocations| {
+        allocations
+            .borrow_mut()
+            .insert(p as usize, (length, capacity));
+    });
     p
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn esbt_free(p: *mut u8, n: u32) {
-    if !p.is_null() && n > 0 {
-        drop(Vec::from_raw_parts(p, n as usize, n as usize));
+    if p.is_null() || n == 0 {
+        return;
+    }
+    let length = n as usize;
+    let capacity = ALLOCATIONS.with(|allocations| {
+        let mut allocations = allocations.borrow_mut();
+        match allocations.get(&(p as usize)).copied() {
+            Some((owned_length, capacity)) if owned_length == length => {
+                allocations.remove(&(p as usize));
+                Some(capacity)
+            }
+            _ => None,
+        }
+    });
+    if let Some(capacity) = capacity {
+        drop(Vec::from_raw_parts(p, length, capacity));
     }
 }
 
@@ -63,226 +230,436 @@ pub extern "C" fn esbt_last_ptr() -> *const u8 {
     LAST.with(|l| l.borrow().as_ptr())
 }
 
+/* ------------------------------------------------------------------------- */
+/* Production opaque-document ABI                                           */
+
 #[no_mangle]
-pub extern "C" fn esbt_init(dmax: i32, base: u32, depth: u32) {
-    let cfg = ReplicaConfig {
-        dmax: if dmax <= 0 { 1 << 16 } else { dmax as i64 },
-        base: if base < 2 { (1u32 << 31) - 1 } else { base },
-        depth: if depth == 0 { 256 } else { depth },
-    };
-    SESSION.with(|s| {
-        *s.borrow_mut() = Some(Session {
-            cfg,
-            replicas: (0..MAX).map(|_| None).collect(),
-        })
-    });
+pub extern "C" fn esbt_doc_last_error_code() -> u32 {
+    LAST_ERROR.with(|code| *code.borrow())
 }
 
 #[no_mangle]
-pub extern "C" fn esbt_add_replica(site: u32) -> i32 {
-    if site == 0 || site as usize >= MAX {
-        return -1;
-    }
-    with(|s| {
-        s.replicas[site as usize] = Some(Replica::new(site, s.cfg.clone()));
-        site as i32
-    })
-    .unwrap_or(-1)
-}
-
-#[no_mangle]
-pub extern "C" fn esbt_len(site: u32) -> i32 {
-    replica(site, |r| r.len() as i32).unwrap_or(-1)
-}
-
-#[no_mangle]
-pub extern "C" fn esbt_hash(site: u32) -> u32 {
-    replica(site, |r| (r.hash_state() & 0xffff_ffff) as u32).unwrap_or(0)
-}
-
-#[no_mangle]
-pub extern "C" fn esbt_pending(site: u32) -> i32 {
-    replica(site, |r| r.pending.len() as i32).unwrap_or(-1)
-}
-
-#[no_mangle]
-pub extern "C" fn esbt_text(site: u32) -> i32 {
-    replica(site, |r| store_str(&r.text())).unwrap_or(-1)
-}
-
-#[no_mangle]
-pub extern "C" fn esbt_insert(site: u32, index: i32, ch: u32) -> i32 {
-    let Some(c) = char::from_u32(ch) else {
-        return -1;
-    };
-    replica(site, |r| {
-        let op = r.local_insert(index.max(0) as usize, c);
-        store(Message::Op(op).encode())
-    })
-    .unwrap_or(-1)
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn esbt_insert_utf8(site: u32, index: i32, ptr: *const u8, len: u32) -> i32 {
-    if ptr.is_null() {
-        return -1;
-    }
-    let bytes = std::slice::from_raw_parts(ptr, len as usize);
-    let Ok(s) = std::str::from_utf8(bytes) else {
-        return -2;
-    };
-    replica(site, |r| {
-        let ops = r.local_insert_str(index.max(0) as usize, s);
-        let mut out = Vec::new();
-        out.extend_from_slice(&(ops.len() as u32).to_le_bytes());
-        for op in ops {
-            let m = Message::Op(op).encode();
-            out.extend_from_slice(&(m.len() as u32).to_le_bytes());
-            out.extend_from_slice(&m);
+pub extern "C" fn esbt_doc_create(site_0: u32, site_1: u32, site_2: u32, site_3: u32) -> i32 {
+    let site = site_from_words([site_0, site_1, site_2, site_3]);
+    match Document::with_defaults(site)
+        .and_then(|document| DOCUMENTS.with(|documents| documents.borrow_mut().insert(document)))
+    {
+        Ok(handle) => {
+            clear_error();
+            handle as i32
         }
-        store(out)
-    })
-    .unwrap_or(-1)
-}
-
-#[no_mangle]
-pub extern "C" fn esbt_delete_range(site: u32, index: i32, n: i32) -> i32 {
-    replica(site, |r| {
-        let ops = r.local_delete_range(index.max(0) as usize, n.max(0) as usize);
-        let mut out = Vec::new();
-        out.extend_from_slice(&(ops.len() as u32).to_le_bytes());
-        for op in ops {
-            let m = Message::Op(op).encode();
-            out.extend_from_slice(&(m.len() as u32).to_le_bytes());
-            out.extend_from_slice(&m);
-        }
-        store(out)
-    })
-    .unwrap_or(-1)
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn esbt_ingest(site: u32, ptr: *const u8, len: u32) -> i32 {
-    if ptr.is_null() {
-        return -1;
+        Err(error) => fail(error),
     }
-    let buf = std::slice::from_raw_parts(ptr, len as usize);
-    let Some(msg) = Message::decode(buf) else {
-        return -2;
-    };
-    replica(site, |r| match msg {
-        Message::Op(op) => {
-            r.receive(op);
+}
+
+#[no_mangle]
+pub extern "C" fn esbt_doc_destroy(handle: u32) -> i32 {
+    let removed = DOCUMENTS.with(|documents| documents.borrow_mut().documents.remove(&handle));
+    if removed.is_some() {
+        clear_error();
+        0
+    } else {
+        fail(invalid_handle())
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn esbt_doc_len(handle: u32) -> i32 {
+    match with_document(handle, |document| Ok(document.len())) {
+        Ok(length) => {
+            clear_error();
+            length as i32
+        }
+        Err(error) => fail(error),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn esbt_doc_hash(handle: u32) -> u32 {
+    match with_document(handle, |document| Ok(document.state_hash())) {
+        Ok(hash) => {
+            clear_error();
+            hash as u32
+        }
+        Err(error) => {
+            fail(error);
             0
         }
-        Message::Snapshot(s) => {
-            if r.len() == 0 && r.log.is_empty() {
-                r.install_snapshot(&s);
-            }
-            1
-        }
-        Message::Hello { .. } | Message::Need { .. } => 2,
-    })
-    .unwrap_or(-1)
-}
-
-#[no_mangle]
-pub extern "C" fn esbt_snapshot(site: u32) -> i32 {
-    replica(site, |r| store(Message::Snapshot(r.snapshot()).encode())).unwrap_or(-1)
-}
-
-#[no_mangle]
-pub extern "C" fn esbt_hello(site: u32) -> i32 {
-    replica(site, |r| {
-        store(
-            Message::Hello {
-                site: r.site,
-                version: r.version.clone(),
-            }
-            .encode(),
-        )
-    })
-    .unwrap_or(-1)
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn esbt_fill_gap(site: u32, ptr: *const u8, len: u32) -> i32 {
-    if ptr.is_null() {
-        return -1;
-    }
-    let buf = std::slice::from_raw_parts(ptr, len as usize);
-    let Some(msg) = Message::decode(buf) else {
-        return -2;
-    };
-    let their = match msg {
-        Message::Hello { version, .. } | Message::Need { version, .. } => version,
-        _ => return -3,
-    };
-    replica(site, |r| {
-        let missing = r.version.missing_after(&Default::default());
-        let gaps = their.missing_after(&r.version);
-        let _ = missing;
-        let mut ops: Vec<Op> = Vec::new();
-        for (&s, &n) in &r.version.next {
-            let theirs = their.observed(s);
-            if n > theirs {
-                ops.extend(r.ops_in_range(s, theirs + 1, n));
-            }
-        }
-        let _ = gaps;
-        let mut out = Vec::new();
-        out.extend_from_slice(&(ops.len() as u32).to_le_bytes());
-        for op in ops {
-            let m = Message::Op(op).encode();
-            out.extend_from_slice(&(m.len() as u32).to_le_bytes());
-            out.extend_from_slice(&m);
-        }
-        store(out)
-    })
-    .unwrap_or(-1)
-}
-
-#[no_mangle]
-pub extern "C" fn esbt_weights_json(site: u32) -> i32 {
-    replica(site, |r| {
-        let mut s = String::from("[");
-        for (i, (w, ch, c)) in r.doc.atoms().into_iter().enumerate() {
-            if i > 0 {
-                s.push(',');
-            }
-            let sc = w
-                .sc
-                .iter()
-                .map(|d| d.to_string())
-                .collect::<Vec<_>>()
-                .join(",");
-            let chs = match ch {
-                '"' => "\\\"".into(),
-                '\\' => "\\\\".into(),
-                '\n' => "\\n".into(),
-                x => x.to_string(),
-            };
-            s.push_str(&format!(
-                "{{\"p\":{},\"q\":{},\"sn\":{},\"sc\":[{sc}],\"site\":{},\"c\":{c},\"ch\":\"{chs}\"}}",
-                w.f.p, w.f.q, w.sn, w.site
-            ));
-        }
-        s.push(']');
-        store_str(&s)
-    })
-    .unwrap_or(-1)
-}
-
-#[no_mangle]
-pub extern "C" fn esbt_verify() -> i32 {
-    let (p, f, log) = verify::run_all();
-    store_str(&format!("pass={p} fail={f}\n{log}"));
-    if f == 0 {
-        p as i32
-    } else {
-        -(f as i32)
     }
 }
 
-#[allow(dead_code)]
-fn _use_snapshot(_: &Snapshot) {}
+#[no_mangle]
+pub extern "C" fn esbt_doc_pending(handle: u32) -> i32 {
+    match with_document(handle, |document| Ok(document.pending_len())) {
+        Ok(length) => {
+            clear_error();
+            length as i32
+        }
+        Err(error) => fail(error),
+    }
+}
+
+/// Store exact little-endian UTF-16 units in the shared result buffer.
+#[no_mangle]
+pub extern "C" fn esbt_doc_text_utf16(handle: u32) -> i32 {
+    match with_document(handle, |document| Ok(document.utf16_units())) {
+        Ok(units) => {
+            clear_error();
+            store(encode_utf16(&units))
+        }
+        Err(error) => fail(error),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn esbt_doc_site(handle: u32) -> i32 {
+    match with_document(handle, |document| Ok(document.site())) {
+        Ok(site) => {
+            clear_error();
+            store(site.to_le_bytes().to_vec())
+        }
+        Err(error) => fail(error),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn esbt_doc_version(handle: u32) -> i32 {
+    match with_document(handle, |document| Ok(document.version().encode())) {
+        Ok(version) => {
+            clear_error();
+            store(version)
+        }
+        Err(error) => fail(error),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn esbt_doc_begin(
+    handle: u32,
+    has_undo_group: u32,
+    group_low: u32,
+    group_high: u32,
+) -> i32 {
+    let group = group_from_words(has_undo_group, group_low, group_high);
+    match with_document(handle, |document| document.begin_transaction(group)) {
+        Ok(()) => {
+            clear_error();
+            store(Vec::new());
+            0
+        }
+        Err(error) => fail(error),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn esbt_doc_commit(handle: u32) -> i32 {
+    match with_document(handle, Document::commit_transaction) {
+        Ok(update) => store_local_update(update),
+        Err(error) => fail(error),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn esbt_doc_abort(handle: u32) -> i32 {
+    match with_document(handle, Document::abort_transaction) {
+        Ok(()) => {
+            clear_error();
+            store(Vec::new());
+            0
+        }
+        Err(error) => fail(error),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn esbt_doc_insert_utf16(
+    handle: u32,
+    index: u32,
+    pointer: *const u8,
+    byte_length: u32,
+    has_undo_group: u32,
+    group_low: u32,
+    group_high: u32,
+) -> i32 {
+    let bytes = match read_input(pointer, byte_length) {
+        Ok(bytes) => bytes,
+        Err(error) => return fail(error),
+    };
+    let units = match decode_utf16(&bytes) {
+        Ok(units) => units,
+        Err(error) => return fail(error),
+    };
+    let group = group_from_words(has_undo_group, group_low, group_high);
+    match with_document(handle, |document| {
+        document.insert_utf16(index as usize, &units, group)
+    }) {
+        Ok(update) => store_local_update(update),
+        Err(error) => fail(error),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn esbt_doc_delete(
+    handle: u32,
+    index: u32,
+    length: u32,
+    has_undo_group: u32,
+    group_low: u32,
+    group_high: u32,
+) -> i32 {
+    let group = group_from_words(has_undo_group, group_low, group_high);
+    match with_document(handle, |document| {
+        document.delete(index as usize, length as usize, group)
+    }) {
+        Ok(update) => store_local_update(update),
+        Err(error) => fail(error),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn esbt_doc_replace_utf16(
+    handle: u32,
+    from: u32,
+    to: u32,
+    pointer: *const u8,
+    byte_length: u32,
+    has_undo_group: u32,
+    group_low: u32,
+    group_high: u32,
+) -> i32 {
+    let bytes = match read_input(pointer, byte_length) {
+        Ok(bytes) => bytes,
+        Err(error) => return fail(error),
+    };
+    let units = match decode_utf16(&bytes) {
+        Ok(units) => units,
+        Err(error) => return fail(error),
+    };
+    let group = group_from_words(has_undo_group, group_low, group_high);
+    match with_document(handle, |document| {
+        document.replace_range_utf16(from as usize, to as usize, &units, group)
+    }) {
+        Ok(update) => store_local_update(update),
+        Err(error) => fail(error),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn esbt_doc_apply(handle: u32, pointer: *const u8, length: u32) -> i32 {
+    let bytes = match read_input(pointer, length) {
+        Ok(bytes) => bytes,
+        Err(error) => return fail(error),
+    };
+    match with_document(handle, |document| document.apply_bytes(&bytes)) {
+        Ok(receipt) => {
+            clear_error();
+            store(receipt.encode())
+        }
+        Err(error) => fail(error),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn esbt_doc_export_update(
+    handle: u32,
+    version_pointer: *const u8,
+    version_length: u32,
+) -> i32 {
+    let bytes = match read_input(version_pointer, version_length) {
+        Ok(bytes) => bytes,
+        Err(error) => return fail(error),
+    };
+    match with_document(handle, |document| {
+        let version = Version::decode_with_limits(&bytes, document.limits())?;
+        document.export_update(&version)
+    }) {
+        Ok(update) => {
+            clear_error();
+            store(update)
+        }
+        Err(error) => fail(error),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn esbt_doc_export_full_snapshot(handle: u32) -> i32 {
+    match with_document(handle, |document| document.export_full_snapshot()) {
+        Ok(snapshot) => {
+            clear_error();
+            store(snapshot)
+        }
+        Err(error) => fail(error),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn esbt_doc_export_compact_snapshot(handle: u32) -> i32 {
+    match with_document(handle, |document| document.export_compact_snapshot()) {
+        Ok(snapshot) => {
+            clear_error();
+            store(snapshot)
+        }
+        Err(error) => fail(error),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn esbt_doc_apply_snapshot(handle: u32, pointer: *const u8, length: u32) -> i32 {
+    let bytes = match read_input(pointer, length) {
+        Ok(bytes) => bytes,
+        Err(error) => return fail(error),
+    };
+    match with_document(handle, |document| document.apply_snapshot_bytes(&bytes)) {
+        Ok(receipt) => {
+            clear_error();
+            store(encode_snapshot_receipt(&receipt))
+        }
+        Err(error) => fail(error),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn esbt_doc_anchor(handle: u32, index: u32, affinity: u32) -> i32 {
+    let affinity = match affinity {
+        1 => Affinity::Before,
+        2 => Affinity::After,
+        _ => {
+            return fail(EngineError::new(
+                ErrorCode::InvalidAnchor,
+                "unknown anchor affinity",
+            ))
+        }
+    };
+    match with_document(handle, |document| {
+        Ok(document.anchor(index as usize, affinity)?.encode())
+    }) {
+        Ok(anchor) => {
+            clear_error();
+            store(anchor)
+        }
+        Err(error) => fail(error),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn esbt_doc_resolve_anchor(handle: u32, pointer: *const u8, length: u32) -> i32 {
+    let bytes = match read_input(pointer, length) {
+        Ok(bytes) => bytes,
+        Err(error) => return fail(error),
+    };
+    match with_document(handle, |document| {
+        let anchor = Anchor::decode_with_limits(&bytes, document.limits())?;
+        Ok(document.resolve_anchor(&anchor))
+    }) {
+        Ok(index) => {
+            clear_error();
+            index as i32
+        }
+        Err(error) => fail(error),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn esbt_doc_insert_at_anchor_utf16(
+    handle: u32,
+    anchor_pointer: *const u8,
+    anchor_length: u32,
+    text_pointer: *const u8,
+    text_byte_length: u32,
+    has_undo_group: u32,
+    group_low: u32,
+    group_high: u32,
+) -> i32 {
+    let anchor_bytes = match read_input(anchor_pointer, anchor_length) {
+        Ok(bytes) => bytes,
+        Err(error) => return fail(error),
+    };
+    let text_bytes = match read_input(text_pointer, text_byte_length) {
+        Ok(bytes) => bytes,
+        Err(error) => return fail(error),
+    };
+    let units = match decode_utf16(&text_bytes) {
+        Ok(units) => units,
+        Err(error) => return fail(error),
+    };
+    let group = group_from_words(has_undo_group, group_low, group_high);
+    match with_document(handle, |document| {
+        let anchor = Anchor::decode_with_limits(&anchor_bytes, document.limits())?;
+        document.insert_utf16_at_anchor(&anchor, &units, group)
+    }) {
+        Ok((update, caret)) => {
+            let anchor = caret.encode();
+            let update = update
+                .map(|update| update.canonical_bytes)
+                .unwrap_or_default();
+            let mut result = Vec::new();
+            result.extend_from_slice(&(anchor.len() as u32).to_le_bytes());
+            result.extend_from_slice(&anchor);
+            result.extend_from_slice(&(update.len() as u32).to_le_bytes());
+            result.extend_from_slice(&update);
+            clear_error();
+            store(result)
+        }
+        Err(error) => fail(error),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn esbt_doc_can_undo(handle: u32) -> i32 {
+    match with_document(handle, |document| Ok(document.can_undo())) {
+        Ok(value) => {
+            clear_error();
+            i32::from(value)
+        }
+        Err(error) => fail(error),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn esbt_doc_can_redo(handle: u32) -> i32 {
+    match with_document(handle, |document| Ok(document.can_redo())) {
+        Ok(value) => {
+            clear_error();
+            i32::from(value)
+        }
+        Err(error) => fail(error),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn esbt_doc_undo(handle: u32) -> i32 {
+    match with_document(handle, Document::undo) {
+        Ok(update) => store_local_update(update),
+        Err(error) => fail(error),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn esbt_doc_redo(handle: u32) -> i32 {
+    match with_document(handle, Document::redo) {
+        Ok(update) => store_local_update(update),
+        Err(error) => fail(error),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn esbt_doc_prune_history(
+    handle: u32,
+    version_pointer: *const u8,
+    version_length: u32,
+) -> i32 {
+    let bytes = match read_input(version_pointer, version_length) {
+        Ok(bytes) => bytes,
+        Err(error) => return fail(error),
+    };
+    match with_document(handle, |document| {
+        let version = Version::decode_with_limits(&bytes, document.limits())?;
+        document.prune_history_through(&version)
+    }) {
+        Ok(pruned) => {
+            clear_error();
+            pruned.min(i32::MAX as usize) as i32
+        }
+        Err(error) => fail(error),
+    }
+}

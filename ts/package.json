@@ -1,8 +1,9 @@
 {
-  "name": "@marks/esbt",
+  "name": "@marks/esbt-reference",
   "version": "0.1.0",
+  "private": true,
   "type": "module",
-  "description": "ESBT sequence CRDT (Mechaoui & Imine, arXiv:2607.28101) — TypeScript engine implementing the marks editor contract: sync, merge, reconcile, undo, presence.",
+  "description": "Frozen TypeScript reference implementation; the production ESBT engine is the Rust/Wasm core.",
   "license": "MIT",
   "repository": {
     "type": "git",

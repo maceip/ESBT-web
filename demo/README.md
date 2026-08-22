@@ -3,17 +3,17 @@
 Playwright, Puppeteer, and [agent-browser](https://github.com/vercel-labs/agent-browser)
 each drive a separate Chrome against the same `?room=`.
 
-Signaling is a WebSocket epidemic hop (`demo/server.mjs`). Chrome is the
-system binary at `/opt/google/chrome/chrome`.
+Signaling is a WebSocket epidemic hop (`demo/server.mjs`). This relay is test
+and demonstration infrastructure, not the production WebSocket server. Chrome
+is the system binary at `/opt/google/chrome/chrome`.
 
 ## Scenarios
 
-1. Paper Situations 1–3 + Alg. 3 + SEC (in-Wasm tests)
-2. Empty start converges
-3. Three concurrent appends (Alpha / Bravo / Charlie)
-4. Causal delete seen by every harness
-5. Late joiner snapshot
-6. Interleaved burst (`+++++` / `-----` / `*****`)
+1. Empty start converges
+2. Three concurrent appends (Alpha / Bravo / Charlie)
+3. Causal delete seen by every harness
+4. Late joiner snapshot
+5. Interleaved burst (`+++++` / `-----` / `*****`)
 
 ## Run
 

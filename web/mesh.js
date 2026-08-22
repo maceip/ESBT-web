@@ -14,6 +14,7 @@ export class Mesh {
     this.onPeer = onPeer;
     this.peers = new Map();
     this.seen = new Set();
+    this.wsQueue = [];
     this.ch = new BroadcastChannel("esbt:" + room);
     this.ch.onmessage = (e) => this._tab(e.data);
     this.ch.postMessage({ t: "hello", from: this.id });
@@ -34,19 +35,34 @@ export class Mesh {
         this._take(JSON.parse(ev.data));
       } catch (_) {}
     };
-    ws.onopen = () => this.onPeer?.({ via: "ws", id: this.id, state: "open" });
+    ws.onopen = () => {
+      for (const message of this.wsQueue.splice(0)) ws.send(message);
+      ws.send(JSON.stringify({ t: "hello", from: this.id }));
+      this.onPeer?.({ via: "ws", id: this.id, state: "open" });
+    };
     return ws;
   }
 
-  gossip(bytes) {
+  gossip(bytes, { force = false } = {}) {
     const id = fnv(bytes);
-    if (this.seen.has(id)) return;
+    if (!force && this.seen.has(id)) return;
     this.seen.add(id);
     this._trim();
     const msg = { t: "bin", from: this.id, id, b64: b64(bytes) };
     this.ch.postMessage(msg);
     this._rtcSend(msg);
-    if (this.ws && this.ws.readyState === 1) this.ws.send(JSON.stringify(msg));
+    if (this.ws) {
+      const encoded = JSON.stringify(msg);
+      if (this.ws.readyState === WebSocket.OPEN) {
+        this.ws.send(encoded);
+      } else if (this.ws.readyState === WebSocket.CONNECTING) {
+        // Wasm can initialize before or after the socket. Retain the initial
+        // anti-entropy hello either way so a late browser cannot miss the only
+        // live-room advertisement.
+        this.wsQueue.push(encoded);
+        if (this.wsQueue.length > 256) this.wsQueue.shift();
+      }
+    }
   }
 
   async offer() {
@@ -82,6 +98,10 @@ export class Mesh {
   }
 
   _take(msg) {
+    if (msg?.t === "hello") {
+      if (msg.from !== this.id) this.onPeer?.({ via: "ws", id: msg.from, state: "joined" });
+      return;
+    }
     if (this.seen.has(msg.id)) return;
     this.seen.add(msg.id);
     this._trim();

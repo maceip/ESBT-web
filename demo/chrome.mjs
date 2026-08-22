@@ -1,5 +1,10 @@
 /** Shared Chrome flags for the three harnesses. */
-export const CHROME = process.env.CHROME_PATH || "/opt/google/chrome/chrome";
+const DEFAULT_CHROME =
+  process.platform === "darwin"
+    ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    : "/opt/google/chrome/chrome";
+
+export const CHROME = process.env.CHROME_PATH || DEFAULT_CHROME;
 
 export const CHROME_ARGS = [
   "--no-sandbox",

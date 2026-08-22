@@ -4,7 +4,8 @@
   "type": "module",
   "scripts": {
     "demo": "node demo/server.mjs",
-    "showcase": "node demo/showcase.mjs"
+    "showcase": "node demo/showcase.mjs",
+    "test:wasm": "node demo/wasm-smoke.mjs"
   },
   "dependencies": {
     "playwright": "^1.55.0",

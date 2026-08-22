@@ -1,15 +1,17 @@
-# `@marks/esbt` — the TypeScript ESBT engine
+# `@marks/esbt-reference` — frozen TypeScript reference engine
+
+This package is private and is not the Marks production engine. It is retained
+as a behavioral reference for the authoritative Rust/Wasm implementation in
+this repository. New engine behavior belongs in Rust.
 
 The ESBT sequence CRDT (Mechaoui & Imine, [arXiv:2607.28101](https://arxiv.org/abs/2607.28101))
-as a pure-TypeScript package implementing the editor contract in
+as a pure-TypeScript reference implementation of the editor surface described in
 [`marks/docs/ESBT-INTEGRATION.md`](https://github.com/maceip/marks/blob/main/docs/ESBT-INTEGRATION.md).
-No WASM, synchronous mutations, UTF-16 indices, main thread in the browser and
-in Node — exactly what the contract demands. The Rust/wasm reference lives in
-this repository's `src/`; this package is its editor-facing sibling and the
-one the [marks](https://github.com/maceip/marks) editor binds to.
+It remains useful for comparing historical behavior, but it is not published,
+consumed by Marks, or evolved as an independent production algorithm.
 
 ```ts
-import { EsbtDoc, EphemeralStore, UndoManager, VersionVector } from '@marks/esbt';
+import { EsbtDoc, EphemeralStore, UndoManager, VersionVector } from '@marks/esbt-reference';
 
 const doc = new EsbtDoc();
 const undo = new UndoManager(doc, { mergeIntervalMs: 500 });
