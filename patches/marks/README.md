@@ -4,8 +4,12 @@ A `git am`-ready series against [maceip/marks](https://github.com/maceip/marks)
 `main` at `c53c617` ("Defer comment highlight paints so CodeMirror is not
 updated mid-update" — the head that includes the browser-surface feature:
 comments, cross-tab sync, clipboard, context menu, voice, offline shell).
-It ships here because this repository's automation has no push access to
-marks; the series was developed and verified against a fresh marks clone.
+
+The same six commits are also pushed to marks directly as the
+[`macprime-esbt-engine-3ead`](https://github.com/maceip/marks/tree/macprime-esbt-engine-3ead)
+branch (head `04e4cb8`), so opening a PR there needs no patch application at
+all. This directory remains the reviewable, self-contained copy of the series
+and the record of how it was verified.
 
 ## Apply
 
