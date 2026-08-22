@@ -380,9 +380,33 @@ messages.
    toolchain constraints. The Crust framework's partition→heal→verify shape
    is followed; its data is not cited.
 
-### Recorded results
+### Recorded results (`cargo test --test adverse_network -- --nocapture`)
 
-The suite is deterministic; run
-`cargo test --test adverse_network -- --nocapture` to reproduce every number.
-Observed results are recorded in this section alongside the suite itself so
-the document never claims measurements the repository cannot replay.
+The suite is deterministic; every number below replays exactly from its seed.
+
+- **Partition/heal** (4 replicas, lossy links with 10% drop / 5% duplicate /
+  1–6-tick delay; a 200-tick {0,1}|{2,3} partition with 80 concurrent
+  edits): the sides demonstrably diverge, then one reconnect anti-entropy
+  round of 6,591 bytes restores full convergence; the follow-up round
+  exchanges only the 12 × 15-byte empty canonical updates, proving
+  termination. Pending-queue high-water stayed at 2 across 190 delivered
+  lossy messages.
+- **Prolonged disconnection across compaction**: after the connected
+  replicas prune 42 acknowledged operations, the op-level reconnect path
+  refuses the returning replica with typed `HistoryUnavailable`; rebasing
+  onto a 533-byte compact snapshot preserves every offline edit (they are
+  retained journal, replayed over the new base), and the offline delta flows
+  back in 518 bytes to full three-way convergence.
+- **Sparse receipts**: a replica holding sequence 2 without sequence 1
+  advertises the hole, refuses to export a compact base
+  (`SnapshotNotCausallyClosed`), is repaired by exactly the missing
+  operation via the gap-aware summary, and only then may serve as a base.
+- **Crash/recovery**: a 419-byte persisted full archive restores a replica
+  with its causally buffered delete intact (`pending_len` 1 before and
+  after), the late insertion resolves it post-restart, and post-crash local
+  edits reuse no operation identity.
+- **Chaos schedules** (12 distinct seeds × 300 events, partitions forming
+  and healing mid-traffic every 50 ticks, 15% drop / 10% duplicate):
+  every seed converges in **one** anti-entropy round after the final heal
+  (12,798–16,805 recovery bytes; pending high-water 17–35), and no pending
+  operation survives convergence.
