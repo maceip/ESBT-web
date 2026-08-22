@@ -218,8 +218,22 @@ from its closed-form fixed-width layout — no external numbers, and quoted
 here together with the lazy run-reservation change below): a 220-unit
 two-site concurrent typing-run snapshot shrinks from 13,334 to 2,370 bytes
 (−82.2%), a 400-operation mixed-editing journal shrinks from 33,558 to
-11,266 bytes (−66.4%), and a single insertion operation drops from 81 to
-26 bytes.
+11,266 bytes (−66.4%) with standalone per-operation encoding, and a single
+insertion operation drops from 81 to 26 bytes.
+
+**Follow-up (format v3): the update payload itself.** Per-operation
+encoding still repeated the 16-byte origin and a 4-byte length prefix per
+operation. Version 3 gives update payloads the same treatment snapshots
+already had: a sorted per-update site dictionary (origins and weight sites
+become varint indexes), self-delimiting varint operation records, and
+sequence paths front-coded across the canonically `(origin, seq)`-sorted
+operation list — which places each typing run's weights adjacently, so run
+roots are paid once per update. The same 400-operation batch as one v3
+update message is 5,665 bytes against 35,173 for v1 (−83.9%) and roughly
+half of the per-operation v2 sum. Downstream, the adverse-network suite's
+measured recovery traffic dropped accordingly (partition-heal round
+6,591 → 2,891 bytes; offline reconnect delta 518 → 211 bytes; crash archive
+419 → 331 bytes).
 
 ## Extension 3 — ESBT as a pluggable identifier allocation strategy
 
@@ -409,26 +423,25 @@ The suite is deterministic; every number below replays exactly from its seed.
 - **Partition/heal** (4 replicas, lossy links with 10% drop / 5% duplicate /
   1–6-tick delay; a 200-tick {0,1}|{2,3} partition with 80 concurrent
   edits): the sides demonstrably diverge, then one reconnect anti-entropy
-  round of 6,591 bytes restores full convergence; the follow-up round
-  exchanges only the 12 × 15-byte empty canonical updates, proving
-  termination. Pending-queue high-water stayed at 2 across 190 delivered
-  lossy messages.
+  round of 2,891 bytes restores full convergence; the follow-up round
+  exchanges only empty canonical updates, proving termination.
+  Pending-queue high-water stayed at 2 across 178 delivered lossy messages.
 - **Prolonged disconnection across compaction**: after the connected
   replicas prune 42 acknowledged operations, the op-level reconnect path
   refuses the returning replica with typed `HistoryUnavailable`; rebasing
-  onto a 533-byte compact snapshot preserves every offline edit (they are
+  onto a 528-byte compact snapshot preserves every offline edit (they are
   retained journal, replayed over the new base), and the offline delta flows
-  back in 518 bytes to full three-way convergence.
+  back in 211 bytes to full three-way convergence.
 - **Sparse receipts**: a replica holding sequence 2 without sequence 1
   advertises the hole, refuses to export a compact base
   (`SnapshotNotCausallyClosed`), is repaired by exactly the missing
   operation via the gap-aware summary, and only then may serve as a base.
-- **Crash/recovery**: a 419-byte persisted full archive restores a replica
+- **Crash/recovery**: a 331-byte persisted full archive restores a replica
   with its causally buffered delete intact (`pending_len` 1 before and
   after), the late insertion resolves it post-restart, and post-crash local
   edits reuse no operation identity.
 - **Chaos schedules** (12 distinct seeds × 300 events, partitions forming
   and healing mid-traffic every 50 ticks, 15% drop / 10% duplicate):
   every seed converges in **one** anti-entropy round after the final heal
-  (12,798–16,805 recovery bytes; pending high-water 17–35), and no pending
-  operation survives convergence.
+  (5,105–6,795 recovery bytes with format v3; pending high-water 17–35),
+  and no pending operation survives convergence.

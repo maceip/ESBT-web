@@ -244,7 +244,10 @@ fn partition_heals_through_membership_anti_entropy() {
         sim.delivered_bytes,
     );
     // A second round exchanges only empty canonical updates.
-    let empty_round: usize = sim.docs.len() * (sim.docs.len() - 1) * 15;
+    let empty_update = esbt::snapshot::Message::Update(esbt::Update::default())
+        .encode()
+        .len();
+    let empty_round = sim.docs.len() * (sim.docs.len() - 1) * empty_update;
     assert_eq!(follow_up_bytes, empty_round, "recovery did not terminate");
 }
 

@@ -22,10 +22,14 @@ const MESSAGE_MAGIC: &[u8; 4] = b"ESBM";
 ///
 /// There is intentionally no legacy fallback: marks has no released data or
 /// clients, so an incompatible format should fail explicitly instead of being
-/// guessed from bytes. Version 2 is the Extension 2 compact identifier
-/// format: site dictionary, canonical varints, implicit defaults, and
-/// front-coded sequence paths over the weight-sorted atom and delete lists.
-pub const ENGINE_FORMAT_VERSION: u16 = 2;
+/// guessed from bytes. Version 2 introduced the Extension 2 compact
+/// identifier format (site dictionary, canonical varints, implicit defaults,
+/// front-coded sequence paths in snapshots); version 3 extends the same
+/// treatment to update payloads: a per-update site dictionary replaces the
+/// repeated 16-byte origins, operations are self-delimiting varint records,
+/// and sequence paths are front-coded across the canonically sorted
+/// operation list.
+pub const ENGINE_FORMAT_VERSION: u16 = 3;
 
 /// Smallest possible encoded atom: flags, p, q, site index, unit, counter.
 const MIN_ATOM_BYTES: usize = 7;

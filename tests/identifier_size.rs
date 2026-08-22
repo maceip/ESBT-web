@@ -110,7 +110,7 @@ fn mixed_editing_journal_shrinks() {
         .map(|op| (v1_op_bytes(op), op.encode().len()))
         .fold((0, 0), |(v1, v2), (a, b)| (v1 + a, v2 + b));
     println!(
-        "mixed journal ({} ops): v1 {v1} B, v2 {v2} B ({:.1}%)",
+        "mixed journal ({} ops, standalone): v1 {v1} B, v2 {v2} B ({:.1}%)",
         ops.len(),
         100.0 * v2 as f64 / v1 as f64
     );
@@ -118,4 +118,23 @@ fn mixed_editing_journal_shrinks() {
     for op in &ops {
         assert_eq!(Op::decode(&op.encode()).as_ref(), Some(op));
     }
+
+    // Format v3: the whole batch as one update message — the per-update site
+    // dictionary and cross-operation path front-coding on top of varints.
+    // The v1 payload was 4 count bytes plus a 4-byte length per operation,
+    // and 11 envelope bytes on both sides.
+    let update = esbt::Update::new(ops.clone()).expect("canonical update");
+    let message = esbt::snapshot::Message::Update(update.clone()).encode();
+    let v1_message = 11 + 4 + v1 + 4 * ops.len();
+    println!(
+        "mixed journal ({} ops, one v3 update message): v1 {v1_message} B, v3 {} B ({:.1}%)",
+        ops.len(),
+        message.len(),
+        100.0 * message.len() as f64 / v1_message as f64
+    );
+    assert!(message.len() * 3 < v1_message);
+    assert_eq!(
+        esbt::snapshot::Message::decode(&message),
+        Some(esbt::snapshot::Message::Update(update))
+    );
 }

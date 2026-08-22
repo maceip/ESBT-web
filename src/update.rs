@@ -1,12 +1,19 @@
 //! Canonical retry-safe update batches and room-facing application receipts.
 
 use crate::clock::Version;
-use crate::codec::Reader;
+use crate::codec::{
+    longest_common_prefix, read_weight_parts, write_uvarint, write_weight_parts, Reader,
+    SiteContext,
+};
 use crate::error::{EngineError, ErrorCode};
 use crate::limits::ResourceLimits;
-use crate::op::Op;
+use crate::op::{Op, OpKind};
 use crate::weight::SiteId;
 use std::collections::BTreeSet;
+
+/// Smallest possible encoded operation in an update payload:
+/// tag, origin index, seq, counter, and a minimal weight (flags, p, q).
+const MIN_PAYLOAD_OP_BYTES: usize = 7;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct OperationRef {
@@ -75,14 +82,52 @@ impl Update {
         self.operations.len()
     }
 
-    /// Payload encoding used inside the versioned `ESBM` envelope.
+    /// Payload encoding used inside the versioned `ESBM` envelope
+    /// (format v3, Extension 2 follow-up).
+    ///
+    /// Every 16-byte site appears once in a sorted dictionary; operations
+    /// reference it by varint index and are self-delimiting, so the per-op
+    /// length prefix of earlier formats is gone. Because operations are
+    /// canonically sorted by `(origin, seq)`, a typing run's weights are
+    /// adjacent, and each sequence path is front-coded against its
+    /// predecessor exactly as snapshot atoms are.
     pub(crate) fn encode_payload(&self) -> Vec<u8> {
-        let mut out = Vec::new();
-        out.extend_from_slice(&(self.operations.len() as u32).to_le_bytes());
+        let mut sites = BTreeSet::new();
         for operation in &self.operations {
-            let encoded = operation.encode();
-            out.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
-            out.extend_from_slice(&encoded);
+            sites.insert(operation.origin);
+            sites.insert(operation.weight.site);
+        }
+        let sites: Vec<SiteId> = sites.into_iter().collect();
+
+        let mut out = Vec::new();
+        write_uvarint(&mut out, sites.len() as u64);
+        for site in &sites {
+            out.extend_from_slice(&site.to_le_bytes());
+        }
+        write_uvarint(&mut out, self.operations.len() as u64);
+        let mut previous_path: &[u32] = &[];
+        for operation in &self.operations {
+            out.push(match operation.kind {
+                OpKind::Ins { .. } => 1,
+                OpKind::Del => 2,
+            });
+            let origin_index = sites
+                .binary_search(&operation.origin)
+                .expect("site table covers every origin");
+            write_uvarint(&mut out, origin_index as u64);
+            write_uvarint(&mut out, operation.seq);
+            write_uvarint(&mut out, operation.counter);
+            let shared = longest_common_prefix(previous_path, &operation.weight.sc);
+            write_weight_parts(
+                &mut out,
+                &operation.weight,
+                SiteContext::Table(&sites),
+                Some(shared),
+            );
+            if let OpKind::Ins { unit } = operation.kind {
+                out.extend_from_slice(&unit.to_le_bytes());
+            }
+            previous_path = &operation.weight.sc;
         }
         out
     }
@@ -100,31 +145,87 @@ impl Update {
         maximum_operations: usize,
     ) -> Result<Self, EngineError> {
         let mut reader = Reader::new(bytes);
-        let count = reader.u32()? as usize;
+        let site_count = reader.uvarint()? as usize;
+        if site_count > limits.max_version_sites || site_count > reader.remaining() / 16 {
+            return Err(EngineError::new(
+                ErrorCode::TooManyVersionSites,
+                "update site table exceeds its bounds",
+            ));
+        }
+        let mut sites = Vec::with_capacity(site_count);
+        let mut previous_site = None;
+        for _ in 0..site_count {
+            let site = reader.u128()?;
+            if site == 0 || previous_site.is_some_and(|previous| previous >= site) {
+                return Err(EngineError::new(
+                    ErrorCode::NonCanonicalEncoding,
+                    "update site table is zero, duplicated, or out of order",
+                ));
+            }
+            previous_site = Some(site);
+            sites.push(site);
+        }
+        let mut referenced_sites = vec![false; sites.len()];
+
+        let count = reader.uvarint()? as usize;
         if count > maximum_operations {
             return Err(EngineError::new(
                 ErrorCode::TooManyOperations,
                 "operation collection exceeds resource policy",
             ));
         }
-        // Every operation has a four-byte length and a nonempty body. Reject
+        // Every operation occupies at least MIN_PAYLOAD_OP_BYTES. Reject
         // impossible counts before allocating attacker-controlled capacity.
-        if count > reader.remaining() / 5 {
+        if count > reader.remaining() / MIN_PAYLOAD_OP_BYTES {
             return Err(EngineError::malformed("impossible update operation count"));
         }
 
         let mut operations = Vec::with_capacity(count);
+        let mut previous_path: Vec<u32> = Vec::new();
         for _ in 0..count {
-            let length = reader.u32()? as usize;
-            if length == 0 || length > reader.remaining() {
-                return Err(EngineError::malformed("invalid operation length in update"));
+            let tag = reader.u8()?;
+            let origin_index = reader.uvarint()? as usize;
+            let origin = *sites.get(origin_index).ok_or_else(|| {
+                EngineError::malformed("operation references a missing site table entry")
+            })?;
+            referenced_sites[origin_index] = true;
+            let seq = reader.uvarint()?;
+            let counter = reader.uvarint()?;
+            let weight = read_weight_parts(
+                &mut reader,
+                limits,
+                SiteContext::Table(&sites),
+                Some(&previous_path),
+            )?;
+            if let Ok(index) = sites.binary_search(&weight.site) {
+                referenced_sites[index] = true;
             }
-            operations.push(Op::decode_with_limits(reader.take(length)?, limits)?);
+            previous_path = weight.sc.clone();
+            let operation = match tag {
+                1 => {
+                    let unit = reader.u16()?;
+                    Op::ins(weight, unit, counter, origin, seq)
+                }
+                2 => Op::del(weight, counter, origin, seq),
+                _ => {
+                    return Err(EngineError::new(
+                        ErrorCode::InvalidOperation,
+                        "unknown operation tag in update",
+                    ))
+                }
+            };
+            operations.push(operation);
         }
         if !reader.is_finished() {
             return Err(EngineError::new(
                 ErrorCode::NonCanonicalEncoding,
                 "update contains trailing bytes",
+            ));
+        }
+        if referenced_sites.iter().any(|used| !used) {
+            return Err(EngineError::new(
+                ErrorCode::NonCanonicalEncoding,
+                "update site table has unused entries",
             ));
         }
         Self::from_canonical_operations(operations)
