@@ -297,6 +297,26 @@ Those hosts accept any generator of totally ordered keys with a
      engine's own strategies against each other, faithfully to the survey
      ruling that no external system is similar enough to donate its numbers.
 
+### Recorded results (`cargo run --release --example trace_replay`)
+
+Replaying the automerge-perf real-keystroke trace (259,778 edits; the replay
+is validated by reproducing the corpus's known final document, 104,852
+units): every strategy converges to the same document; the paper's midpoint
+produces a 20.8 MB v2-encoded journal (≈80 B/op) and a 1.30 MB compact
+snapshot; `BoundaryLow(64)` trades deeper mean paths (46.8 vs 38.8
+components) for an 8% smaller journal. On the synthetic 10,000-op
+adversarial middle-insertion pattern the strategy seam matters far more:
+`BoundaryLow(64)` emits 175 MB of journal against midpoint's 275 MB (−36%).
+That workload also quantifies a real engine trade-off the evaluation
+surfaced: this repository's typing-run reservation (site-discriminator
+prefixes) amplifies sequence-path depth under adversarial middle insertion
+(mean ≈17,500 components at 10,000 ops on a bare `Replica`); the production
+`Document` boundary already fails such mints typed (`IdentifierTooDeep`)
+instead of emitting weights peers would reject, and boundary editing is
+unaffected (constant depth ≤ 7). The adaptive controller correctly stays
+idle on the real trace — at the default bound the fraction layer is never
+pressured — which is the designed behavior, not a gap.
+
 ## Extension 4 — adverse network conditions
 
 ### What the paper proposes, cross-checked

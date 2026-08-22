@@ -1,6 +1,7 @@
 //! Algorithm 3 — per-replica control, plus join snapshot and op log.
 
 use crate::allocator::{AdaptiveDmaxConfig, Allocator};
+use crate::newseq::AllocationStrategy;
 use crate::clock::{SiteReceiptCheckpoint, Version};
 use crate::error::{EngineError, ErrorCode};
 use crate::op::{Op, OpKind};
@@ -18,6 +19,9 @@ pub struct ReplicaConfig {
     /// with the observed workload. Adaptation is a per-replica policy and
     /// never affects convergence (weight ordering ignores `Dmax`).
     pub adaptive_dmax: Option<AdaptiveDmaxConfig>,
+    /// Extension 3: sequence-path digit allocation strategy. Also a local
+    /// policy; replicas running different strategies interoperate.
+    pub strategy: AllocationStrategy,
 }
 
 impl Default for ReplicaConfig {
@@ -27,6 +31,7 @@ impl Default for ReplicaConfig {
             base: (1u32 << 31) - 1,
             depth: 256,
             adaptive_dmax: None,
+            strategy: AllocationStrategy::Midpoint,
         }
     }
 }
@@ -220,6 +225,7 @@ impl Replica {
     pub fn new(site: SiteId, cfg: ReplicaConfig) -> Self {
         assert!(site != 0, "site 0 is reserved for sentinels");
         let mut alloc = Allocator::new(cfg.dmax, cfg.base, cfg.depth);
+        alloc.strategy = cfg.strategy;
         if let Some(adaptive) = cfg.adaptive_dmax {
             alloc.enable_adaptive_dmax(adaptive);
         }
@@ -1052,7 +1058,7 @@ mod tests {
             dmax: 5,
             base: 10,
             depth: 3,
-            adaptive_dmax: None,
+            ..Default::default()
         }
     }
 
@@ -1517,6 +1523,7 @@ mod tests {
                         window: 8,
                         ..Default::default()
                     }),
+                    ..Default::default()
                 },
             ),
         ];

@@ -3,7 +3,7 @@
 
 use crate::codec::encoded_weight_len;
 use crate::fraction::Fraction;
-use crate::newseq::{newseq, newseq_unbounded};
+use crate::newseq::{newseq, newseq_unbounded, AllocationStrategy};
 use crate::weight::{SiteId, Weight};
 use std::collections::HashMap;
 
@@ -223,6 +223,9 @@ pub struct Allocator {
     pub dmax: i64,
     pub base: u32,
     pub depth: u32,
+    /// Extension 3: pluggable digit-allocation strategy for the sequence
+    /// path layer. A local policy; convergence never depends on it.
+    pub strategy: AllocationStrategy,
     pub tracker: Tracker,
     adaptive: Option<AdaptiveDmax>,
 }
@@ -233,6 +236,7 @@ impl Allocator {
             dmax: dmax.max(2),
             base: base.max(2),
             depth: depth.max(1),
+            strategy: AllocationStrategy::default(),
             tracker: Tracker::default(),
             adaptive: None,
         }
@@ -395,14 +399,21 @@ impl Allocator {
         }
 
         // Sequence path (Situation 3): same fraction, no sn room.
-        let sc = newseq(&left.sc, &right.sc, self.base, self.depth, site);
+        let sc = newseq(
+            &left.sc,
+            &right.sc,
+            self.base,
+            self.depth,
+            site,
+            self.strategy,
+        );
         if let Some(weight) = between(Weight::new(fb, left.sn, sc, site)) {
             return Some(weight);
         }
 
         // Past DEPTH the constant site tie may recycle a path. Retry without
         // the cap and validate the complete candidate.
-        let sc = newseq_unbounded(&left.sc, &right.sc, self.base);
+        let sc = newseq_unbounded(&left.sc, &right.sc, self.base, self.strategy);
         if let Some(weight) = between(Weight::new(fb, left.sn, sc, site)) {
             return Some(weight);
         }
