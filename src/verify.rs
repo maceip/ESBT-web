@@ -73,6 +73,7 @@ pub fn run_all() -> (u32, u32, String) {
         dmax: 5,
         base: 10,
         depth: 3,
+        adaptive_dmax: None,
     };
     {
         let mut a = Replica::new(1, cfg.clone());

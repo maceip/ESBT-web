@@ -1,5 +1,7 @@
-//! Algorithm 2 — CREATE_WEIGHT, plus the site Tracker (Definition 4).
+//! Algorithm 2 — CREATE_WEIGHT, plus the site Tracker (Definition 4) and the
+//! Extension 1 adaptive `Dmax` controller.
 
+use crate::codec::encoded_weight_len;
 use crate::fraction::Fraction;
 use crate::newseq::{newseq, newseq_unbounded};
 use crate::weight::{SiteId, Weight};
@@ -70,12 +72,159 @@ impl Tracker {
     }
 }
 
+/// Hard ceiling for any `Dmax`. It preserves the `i128` cross-multiplication
+/// headroom in `Fraction::cmp_rat` and matches the paper's evaluated 32-bit
+/// fraction space (§8.3.1).
+pub const DMAX_HARD_CEILING: i64 = 1 << 31;
+
+/// Extension 1 (paper §10): tune `Dmax` from observed editing dynamics.
+///
+/// `Dmax` is a purely local allocation policy — Definition 2's total order
+/// and the convergence theorems never consult it — so each replica may adapt
+/// it independently and over time without coordination. The controller below
+/// is a magnitude-discriminating hill-climb with hysteresis: near-miss
+/// rejections (linear boundary drift) justify raising the bound, overshoot
+/// rejections (exponential middle-insertion pinches) never do, and every
+/// raise is a probe that is reverted if the observed identifier byte cost
+/// regresses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdaptiveDmaxConfig {
+    /// `Dmax` never adapts below this bound.
+    pub floor: i64,
+    /// `Dmax` never adapts above this bound (clamped to the hard ceiling).
+    pub ceiling: i64,
+    /// Fraction-layer decisions per adjustment window.
+    pub window: u32,
+    /// Windows to hold still after a reverted probe (hysteresis).
+    pub holdoff_windows: u32,
+}
+
+impl Default for AdaptiveDmaxConfig {
+    fn default() -> Self {
+        AdaptiveDmaxConfig {
+            floor: 16,
+            ceiling: DMAX_HARD_CEILING,
+            window: 256,
+            holdoff_windows: 4,
+        }
+    }
+}
+
+/// A raise under evaluation: where to fall back to and what identifier cost
+/// looked like before the raise.
+#[derive(Clone, Copy, Debug)]
+struct DmaxProbe {
+    previous_dmax: i64,
+    baseline_cost: u64,
+}
+
+#[derive(Clone, Debug)]
+struct AdaptiveDmax {
+    config: AdaptiveDmaxConfig,
+    /// Fraction-layer decisions observed in the current window.
+    decisions: u32,
+    near_misses: u32,
+    overshoots: u32,
+    /// EWMA of encoded identifier bytes, fixed-point with 8 fractional bits
+    /// and a 1/8 smoothing step. Integer arithmetic keeps the controller
+    /// bit-identical across native and Wasm builds.
+    cost_ewma: u64,
+    probe: Option<DmaxProbe>,
+    holdoff: u32,
+}
+
+/// Rejected mediants within this factor of `Dmax` are near misses: the kind
+/// of linear fraction growth (boundary editing) that a larger bound would
+/// have absorbed. Anything larger is an exponential pinch that belongs to
+/// the `sn`/`sc` layers by design.
+const NEAR_MISS_FACTOR: i64 = 8;
+const COST_FRACTION_BITS: u32 = 8;
+const COST_SMOOTHING_SHIFT: u32 = 3;
+
+impl AdaptiveDmax {
+    fn new(mut config: AdaptiveDmaxConfig) -> Self {
+        config.floor = config.floor.clamp(2, DMAX_HARD_CEILING);
+        config.ceiling = config.ceiling.clamp(config.floor, DMAX_HARD_CEILING);
+        config.window = config.window.max(1);
+        AdaptiveDmax {
+            config,
+            decisions: 0,
+            near_misses: 0,
+            overshoots: 0,
+            cost_ewma: 0,
+            probe: None,
+            holdoff: 0,
+        }
+    }
+
+    fn observe_cost(&mut self, encoded_bytes: usize) {
+        let sample = (encoded_bytes as u64) << COST_FRACTION_BITS;
+        if self.cost_ewma == 0 {
+            self.cost_ewma = sample;
+        } else {
+            self.cost_ewma = self.cost_ewma - (self.cost_ewma >> COST_SMOOTHING_SHIFT)
+                + (sample >> COST_SMOOTHING_SHIFT);
+        }
+    }
+
+    /// One fraction-layer decision: the mediant strictly separated the
+    /// neighbor fractions, so the fraction layer had jurisdiction.
+    fn observe_decision(&mut self, mediant: Fraction, dmax: i64, accepted: bool) {
+        self.decisions = self.decisions.saturating_add(1);
+        if !accepted {
+            let magnitude = mediant.p.max(mediant.q);
+            if magnitude < dmax.saturating_mul(NEAR_MISS_FACTOR) {
+                self.near_misses = self.near_misses.saturating_add(1);
+            } else {
+                self.overshoots = self.overshoots.saturating_add(1);
+            }
+        }
+    }
+
+    /// Window-boundary step. Returns the `Dmax` the allocator should use.
+    fn adapt(&mut self, current_dmax: i64) -> i64 {
+        if self.decisions < self.config.window {
+            return current_dmax;
+        }
+        let rejections = self.near_misses + self.overshoots;
+        let near_dominated = self.near_misses * 2 > rejections;
+        let pressured = u64::from(rejections) * 4 >= u64::from(self.decisions);
+        self.decisions = 0;
+        self.near_misses = 0;
+        self.overshoots = 0;
+
+        let mut dmax = current_dmax;
+        if let Some(probe) = self.probe.take() {
+            // Revert a raise that made identifiers more expensive, and hold
+            // still afterwards so the controller cannot oscillate.
+            let regression_bound = probe.baseline_cost + probe.baseline_cost / 8;
+            if probe.baseline_cost != 0 && self.cost_ewma > regression_bound {
+                self.holdoff = self.config.holdoff_windows;
+                return probe.previous_dmax.max(self.config.floor);
+            }
+        }
+        if self.holdoff > 0 {
+            self.holdoff -= 1;
+            return dmax;
+        }
+        if pressured && near_dominated && dmax < self.config.ceiling {
+            self.probe = Some(DmaxProbe {
+                previous_dmax: dmax,
+                baseline_cost: self.cost_ewma,
+            });
+            dmax = dmax.saturating_mul(2).min(self.config.ceiling);
+        }
+        dmax
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Allocator {
     pub dmax: i64,
     pub base: u32,
     pub depth: u32,
     pub tracker: Tracker,
+    adaptive: Option<AdaptiveDmax>,
 }
 
 impl Allocator {
@@ -85,7 +234,27 @@ impl Allocator {
             base: base.max(2),
             depth: depth.max(1),
             tracker: Tracker::default(),
+            adaptive: None,
         }
+    }
+
+    /// Enable Extension 1 adaptation. The current `Dmax` is clamped into the
+    /// configured band and then evolves with the observed workload. The
+    /// controller state is deliberately outside the tracker's transaction
+    /// journal: it is a local heuristic, so counting an allocation that a
+    /// rolled-back transaction discards is harmless, while replaying it
+    /// would couple ordering-invariant state to product-level undo.
+    pub fn enable_adaptive_dmax(&mut self, config: AdaptiveDmaxConfig) {
+        let controller = AdaptiveDmax::new(config);
+        self.dmax = self
+            .dmax
+            .clamp(controller.config.floor, controller.config.ceiling);
+        self.adaptive = Some(controller);
+    }
+
+    /// The `Dmax` currently in force (adaptive or static).
+    pub fn current_dmax(&self) -> i64 {
+        self.dmax
     }
 
     /// Evaluation defaults (paper §8.1): base = 2^31-1, depth = 256.
@@ -152,6 +321,29 @@ impl Allocator {
     /// Callers surface that condition as typed allocation exhaustion; they must
     /// never widen the requested gap or insert an out-of-range weight.
     pub fn create_weight(&mut self, left: &Weight, right: &Weight, site: SiteId) -> Option<Weight> {
+        if self.adaptive.is_some() {
+            let mediant = left.f.mediant(right.f);
+            let separates = !mediant.is_begin()
+                && !mediant.is_end()
+                && left.f < mediant
+                && mediant < right.f;
+            if separates {
+                let accepted = self.mediant_fits(mediant);
+                let dmax = self.dmax;
+                if let Some(controller) = self.adaptive.as_mut() {
+                    controller.observe_decision(mediant, dmax, accepted);
+                }
+            }
+        }
+        let allocated = self.create_weight_inner(left, right, site);
+        if let (Some(weight), Some(controller)) = (&allocated, self.adaptive.as_mut()) {
+            controller.observe_cost(encoded_weight_len(weight, site));
+            self.dmax = controller.adapt(self.dmax);
+        }
+        allocated
+    }
+
+    fn create_weight_inner(&mut self, left: &Weight, right: &Weight, site: SiteId) -> Option<Weight> {
         debug_assert!(left < right, "CREATE_WEIGHT requires w1 prec w2");
         let between = |weight: Weight| (left < &weight && &weight < right).then_some(weight);
         let fm = left.f.mediant(right.f);
@@ -269,6 +461,107 @@ mod tests {
         assert_eq!(w.sn, 0);
         assert_eq!(w.site, 1);
         assert_eq!(w.sc, vec![a.site_digit(1)]);
+    }
+
+    fn adaptive(window: u32, holdoff: u32) -> AdaptiveDmaxConfig {
+        AdaptiveDmaxConfig {
+            floor: 8,
+            ceiling: DMAX_HARD_CEILING,
+            window,
+            holdoff_windows: holdoff,
+        }
+    }
+
+    #[test]
+    fn boundary_pressure_raises_dmax_but_a_static_allocator_stays_put() {
+        let mut adaptive_alloc = Allocator::new(8, 10, 3);
+        adaptive_alloc.enable_adaptive_dmax(adaptive(16, 4));
+        let mut static_alloc = Allocator::new(8, 10, 3);
+
+        for allocator in [&mut adaptive_alloc, &mut static_alloc] {
+            // Prepend workload: every insertion lands between BEGIN and the
+            // current first weight, so fraction magnitudes grow linearly and
+            // rejections are near misses.
+            let mut right = Weight::end();
+            for _ in 0..200 {
+                let weight = allocator
+                    .create_weight(&Weight::begin(), &right, 1)
+                    .expect("prepend allocation");
+                assert!(Weight::begin() < weight && weight < right);
+                right = weight;
+            }
+        }
+
+        assert!(
+            adaptive_alloc.current_dmax() >= 64,
+            "adaptive dmax stuck at {}",
+            adaptive_alloc.current_dmax()
+        );
+        assert_eq!(static_alloc.current_dmax(), 8);
+    }
+
+    #[test]
+    fn overshoot_rejections_never_raise_dmax() {
+        let mut allocator = Allocator::new(8, 10, 3);
+        allocator.enable_adaptive_dmax(adaptive(8, 4));
+
+        // A neighbor whose fraction already dwarfs the bound: the mediant
+        // magnitude is far past NEAR_MISS_FACTOR × Dmax every time, which is
+        // the exponential-pinch signature raising Dmax cannot fix.
+        let mut left = Weight::new(Fraction::new(100, 1), 0, vec![0], 1);
+        for _ in 0..32 {
+            let weight = allocator
+                .create_weight(&left, &Weight::end(), 1)
+                .expect("sn-layer allocation");
+            assert!(left < weight && weight < Weight::end());
+            left = weight;
+        }
+        assert_eq!(allocator.current_dmax(), 8);
+    }
+
+    #[test]
+    fn regressive_probe_reverts_and_holds_off() {
+        let mut allocator = Allocator::new(8, 10, 3);
+        allocator.enable_adaptive_dmax(adaptive(4, 1));
+
+        let cheap_left = Weight::new(Fraction::new(30, 1), 0, vec![0], 1);
+        let run_cheap_window = |allocator: &mut Allocator| {
+            for _ in 0..4 {
+                allocator
+                    .create_weight(&cheap_left, &Weight::end(), 1)
+                    .expect("cheap near-miss allocation");
+            }
+        };
+
+        // Window 1: near-miss pressure with cheap identifiers → probe to 16.
+        run_cheap_window(&mut allocator);
+        assert_eq!(allocator.current_dmax(), 16);
+
+        // Window 2: still near-miss pressured, but the gap's fallback copies
+        // an expensive deep path into every identifier. Cost regresses, so
+        // the probe must revert.
+        let expensive_left = Weight::new(
+            Fraction::new(30, 1),
+            5,
+            (0..64).map(|digit| (1 << 28) + digit).collect(),
+            1,
+        );
+        let expensive_right = Weight::new(Fraction::new(31, 1), 0, vec![0], 1);
+        for _ in 0..4 {
+            let weight = allocator
+                .create_weight(&expensive_left, &expensive_right, 1)
+                .expect("expensive fallback allocation");
+            assert!(expensive_left < weight && weight < expensive_right);
+        }
+        assert_eq!(allocator.current_dmax(), 8, "regressive probe not reverted");
+
+        // Window 3: pressure continues but hysteresis holds the bound still.
+        run_cheap_window(&mut allocator);
+        assert_eq!(allocator.current_dmax(), 8, "holdoff ignored");
+
+        // Window 4: holdoff expired; the controller may probe again.
+        run_cheap_window(&mut allocator);
+        assert_eq!(allocator.current_dmax(), 16);
     }
 
     #[test]

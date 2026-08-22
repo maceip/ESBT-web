@@ -22,7 +22,7 @@ pub mod weight;
 #[cfg(target_arch = "wasm32")]
 pub mod wasm_abi;
 
-pub use allocator::Allocator;
+pub use allocator::{AdaptiveDmaxConfig, Allocator, DMAX_HARD_CEILING};
 pub use anchor::{Affinity, Anchor, AnchorRange, AnchorTarget};
 pub use document::{Document, LocalUpdate, SnapshotKind, SnapshotReceipt, UndoDisposition};
 pub use error::{EngineError, ErrorCode};
