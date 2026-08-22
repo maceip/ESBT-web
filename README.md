@@ -7,8 +7,17 @@ adapter. The Rust/Wasm implementation is the sole production engine. The
 private package in [`ts/`](ts/) is frozen as a behavioral reference only; Marks
 must not import or ship it as an independent engine.
 
-`extensions.md` is **not** in this tree (adaptive \(D_{\max}\), compact `sc`,
-Yjs/Automerge, partition-recovery study).
+The four `extensions.md` directions (paper §10) are implemented in this
+tree; the consideration stacks, prior-work rulings, picks, and recorded
+measurements live in
+[`docs/extension-considerations.md`](docs/extension-considerations.md):
+
+| Extension | Where |
+|---|---|
+| Adaptive \(D_{\max}\) (magnitude-discriminating hill-climb, hysteresis) | `src/allocator.rs` (`AdaptiveDmaxConfig`) |
+| Compact `sc` encoding (format v2: varints, implicit defaults, site dictionary, front-coded paths) | `src/codec.rs`, `src/snapshot.rs`, `tests/identifier_size.rs` |
+| Pluggable allocation (strategy seam, order-preserving keys, real-trace evaluation) | `src/newseq.rs`, `src/orderkey.rs`, `examples/trace_replay.rs` |
+| Adverse networks (deterministic partition/disconnection/recovery study) | `tests/adverse_network.rs` |
 
 ## Repository boundary
 
