@@ -2,7 +2,7 @@
 
 use crate::allocator::Allocator;
 use crate::fraction::Fraction;
-use crate::newseq::newseq;
+use crate::newseq::{newseq, AllocationStrategy};
 use crate::replica::{Replica, ReplicaConfig};
 use crate::weight::Weight;
 
@@ -54,8 +54,8 @@ pub fn run_all() -> (u32, u32, String) {
             &mid.to_string(),
         );
     }
-    check("NEWSEQ ex1", newseq(&[3], &[7], 10, 3, 2) == vec![5], "");
-    check("NEWSEQ ex2", newseq(&[3], &[4], 10, 3, 2) == vec![3, 5], "");
+    check("NEWSEQ ex1", newseq(&[3], &[7], 10, 3, 2, AllocationStrategy::Midpoint) == vec![5], "");
+    check("NEWSEQ ex2", newseq(&[3], &[4], 10, 3, 2, AllocationStrategy::Midpoint) == vec![3, 5], "");
 
     {
         let mut a = Allocator::new(10, 10, 3);
@@ -73,6 +73,7 @@ pub fn run_all() -> (u32, u32, String) {
         dmax: 5,
         base: 10,
         depth: 3,
+        ..Default::default()
     };
     {
         let mut a = Replica::new(1, cfg.clone());

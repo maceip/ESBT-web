@@ -65,11 +65,97 @@ export class EsbtRuntime {
   }
 }
 
+// Canonical LEB128, matching the engine codec (non-minimal forms rejected).
+function pushVarint(bytes, value) {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new EsbtError(4, "esbt: config values must be non-negative safe integers");
+  }
+  do {
+    const group = value % 128;
+    value = Math.floor(value / 128);
+    bytes.push(value > 0 ? group | 0x80 : group);
+  } while (value > 0);
+}
+
+const STRATEGY_TAGS = {
+  midpoint: 0,
+  "boundary-low": 1,
+  "boundary-high": 2,
+  "alternating-by-depth": 3,
+};
+
+const LIMIT_FIELDS = [
+  "maxMessageBytes",
+  "maxOperationsPerUpdate",
+  "maxIdentifierDepth",
+  "maxVersionSites",
+  "maxSparseReceipts",
+  "maxSnapshotItems",
+  "maxPendingOperations",
+  "maxDeferredDeletes",
+  "maxDocumentUnits",
+  "maxAllocationAttempts",
+  "maxRetainedOperations",
+  "maxUndoTransactions",
+];
+
+const DEFAULT_LIMITS = {
+  maxMessageBytes: 16 * 1024 * 1024,
+  maxOperationsPerUpdate: 100_000,
+  maxIdentifierDepth: 1_024,
+  maxVersionSites: 65_536,
+  maxSparseReceipts: 1_000_000,
+  maxSnapshotItems: 2_000_000,
+  maxPendingOperations: 250_000,
+  maxDeferredDeletes: 2_000_000,
+  maxDocumentUnits: 2_000_000,
+  maxAllocationAttempts: 65_536,
+  maxRetainedOperations: 4_000_000,
+  maxUndoTransactions: 10_000,
+};
+
+/**
+ * Encode a document configuration for `esbt_doc_create_configured`
+ * (config format v1; the exact layout is documented in `src/config.rs`).
+ *
+ * All fields are optional; defaults match `Document.with_defaults`:
+ * `{ dmax, base, depth, strategy: { kind, boundary }, adaptiveDmax:
+ * { floor, ceiling, window, holdoffWindows }, limits: { ...LIMIT_FIELDS } }`.
+ */
+export function encodeDocumentConfig(config = {}) {
+  const bytes = [1, 0]; // format version u16 LE
+  const flags = (config.adaptiveDmax ? 0b01 : 0) | 0b10; // limits always sent
+  bytes.push(flags);
+  pushVarint(bytes, config.dmax ?? 65_536);
+  pushVarint(bytes, config.base ?? 2_147_483_647);
+  pushVarint(bytes, config.depth ?? 256);
+  const strategy = config.strategy ?? { kind: "midpoint" };
+  const tag = STRATEGY_TAGS[strategy.kind];
+  if (tag === undefined) throw new EsbtError(4, `esbt: unknown strategy ${strategy.kind}`);
+  bytes.push(tag);
+  if (tag !== 0) pushVarint(bytes, strategy.boundary ?? 64);
+  if (config.adaptiveDmax) {
+    pushVarint(bytes, config.adaptiveDmax.floor ?? 16);
+    pushVarint(bytes, config.adaptiveDmax.ceiling ?? 2_147_483_648);
+    pushVarint(bytes, config.adaptiveDmax.window ?? 256);
+    pushVarint(bytes, config.adaptiveDmax.holdoffWindows ?? 4);
+  }
+  const limits = { ...DEFAULT_LIMITS, ...(config.limits ?? {}) };
+  for (const field of LIMIT_FIELDS) pushVarint(bytes, limits[field]);
+  return new Uint8Array(bytes);
+}
+
 export class EsbtDocument {
   static async create(options = {}) {
     const runtime = options.runtime ?? (await EsbtRuntime.load(options.wasmUrl));
     const siteWords = normalizeSiteId(options.siteId);
-    const handle = runtime.check(runtime.exports.esbt_doc_create(...siteWords));
+    const handle = options.config
+      ? runtime.withBytes(encodeDocumentConfig(options.config), (pointer, length) =>
+          runtime.check(
+            runtime.exports.esbt_doc_create_configured(...siteWords, pointer, length),
+          ),
+        )
+      : runtime.check(runtime.exports.esbt_doc_create(...siteWords));
     if (handle === 0) throw new EsbtError(24, "esbt: document creation returned no handle");
     return new EsbtDocument(runtime, handle, siteWords);
   }
@@ -326,6 +412,29 @@ export class EsbtDocument {
         this.runtime.exports.esbt_doc_prune_history(this.handle, pointer, length),
       ),
     );
+  }
+
+  /** Retained journal size — the quantity compaction policy must bound. */
+  get retainedOperations() {
+    this.assertLive();
+    return this.runtime.check(
+      this.runtime.exports.esbt_doc_retained_operations(this.handle),
+    );
+  }
+
+  /** Encoded causal prefix below which reconnect deltas are unavailable. */
+  historyFloor() {
+    this.assertLive();
+    this.runtime.check(this.runtime.exports.esbt_doc_history_floor(this.handle));
+    return this.runtime.last();
+  }
+
+  /** Current Dmax (moves over time when the adaptive controller is on). */
+  currentDmax() {
+    this.assertLive();
+    this.runtime.check(this.runtime.exports.esbt_doc_current_dmax(this.handle));
+    const bytes = this.runtime.last();
+    return Number(new DataView(bytes.buffer, bytes.byteOffset, 8).getBigInt64(0, true));
   }
 
   get canUndo() {

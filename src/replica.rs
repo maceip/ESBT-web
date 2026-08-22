@@ -1,6 +1,7 @@
 //! Algorithm 3 — per-replica control, plus join snapshot and op log.
 
-use crate::allocator::Allocator;
+use crate::allocator::{AdaptiveDmaxConfig, Allocator};
+use crate::newseq::AllocationStrategy;
 use crate::clock::{SiteReceiptCheckpoint, Version};
 use crate::error::{EngineError, ErrorCode};
 use crate::op::{Op, OpKind};
@@ -14,6 +15,13 @@ pub struct ReplicaConfig {
     pub dmax: i64,
     pub base: u32,
     pub depth: u32,
+    /// Extension 1: when set, `dmax` is only the starting point and evolves
+    /// with the observed workload. Adaptation is a per-replica policy and
+    /// never affects convergence (weight ordering ignores `Dmax`).
+    pub adaptive_dmax: Option<AdaptiveDmaxConfig>,
+    /// Extension 3: sequence-path digit allocation strategy. Also a local
+    /// policy; replicas running different strategies interoperate.
+    pub strategy: AllocationStrategy,
 }
 
 impl Default for ReplicaConfig {
@@ -22,6 +30,8 @@ impl Default for ReplicaConfig {
             dmax: 1 << 16,
             base: (1u32 << 31) - 1,
             depth: 256,
+            adaptive_dmax: None,
+            strategy: AllocationStrategy::Midpoint,
         }
     }
 }
@@ -43,9 +53,22 @@ pub enum SnapshotMergeError {
     SnapshotStateConflict,
 }
 
-/// Transient local intention state. A consecutive typing run keeps the first
-/// ESBT weight as a site-distinct prefix and appends an intra-run component.
-/// Concurrent runs then sort as units instead of alternating by character.
+/// Transient local intention state. A consecutive typing run roots at its
+/// first character's weight and appends an intra-run component per keystroke,
+/// so concurrent runs sort as units instead of alternating by character.
+///
+/// The reservation is lazy: the first character pays nothing — no
+/// site-discriminator suffix is minted until a run actually continues, and
+/// even then continuations extend the first character's own path. Freshly
+/// allocated candidates already end in a site-derived digit at the mediant
+/// and gap-midpoint layers, so concurrent first characters are distinct
+/// weights whose subtrees cannot nest. The one corner this trades away is
+/// the sequence-number ladder, whose candidates copy `left.sc` verbatim
+/// (paper Algorithm 2 line 21): two sites entering that ladder concurrently
+/// may interleave after their first characters. The eager alternative — a
+/// fixed-width full-site prefix on every insertion — made adversarial
+/// middle-insertion identifier depth grow several digits per operation,
+/// which is a far worse trade (see docs/extension-considerations.md).
 #[derive(Clone)]
 struct LocalInsertRun {
     root: Weight,
@@ -214,9 +237,14 @@ pub struct Replica {
 impl Replica {
     pub fn new(site: SiteId, cfg: ReplicaConfig) -> Self {
         assert!(site != 0, "site 0 is reserved for sentinels");
+        let mut alloc = Allocator::new(cfg.dmax, cfg.base, cfg.depth);
+        alloc.strategy = cfg.strategy;
+        if let Some(adaptive) = cfg.adaptive_dmax {
+            alloc.enable_adaptive_dmax(adaptive);
+        }
         Replica {
             site,
-            alloc: Allocator::new(cfg.dmax, cfg.base, cfg.depth),
+            alloc,
             doc: DocTree::default(),
             pending: PendingQueue::default(),
             delete_log: HashSet::new(),
@@ -509,18 +537,24 @@ impl Replica {
                 )
             })?;
 
-            // NEWSEQ can choose the same midpoint at two sites before its
-            // fixed-depth tie is needed. Reserve a site-specific child of that
-            // midpoint when it remains in the chosen gap, so the run roots do
-            // not differ only by the final site tie-break.
-            let mut reserved = weight.clone();
-            reserved.sc.extend(self.alloc.site_discriminator(self.site));
-            let run_reserved =
-                left < reserved && reserved < immediate_right && !self.doc.contains(&reserved);
-            if run_reserved {
-                weight = reserved;
+            // Lazy run reservation: the first character is the run root and
+            // continuations mint children of this exact weight. The root must
+            // not be a weight another site can mint identically, or a twin
+            // would sort between the root and its continuations. Mediant and
+            // gap-midpoint candidates already end in this site's digit; the
+            // sn-ladder (which copies left.sc) and NEWSEQ midpoints do not,
+            // so those roots are marked with one site digit — down from the
+            // fixed-width full-site prefix that made adversarial
+            // middle-insertion depth grow by several digits per operation.
+            let site_digit = self.alloc.site_digit(self.site);
+            if weight.sc.last() != Some(&site_digit) {
+                let mut marked = weight.clone();
+                marked.sc.push(site_digit);
+                if left < marked && marked < immediate_right && !self.doc.contains(&marked) {
+                    weight = marked;
+                }
             }
-            self.local_insert_run = run_reserved.then(|| LocalInsertRun {
+            self.local_insert_run = Some(LocalInsertRun {
                 root: weight.clone(),
                 last: weight.clone(),
                 last_counter: 0,
@@ -1043,6 +1077,7 @@ mod tests {
             dmax: 5,
             base: 10,
             depth: 3,
+            ..Default::default()
         }
     }
 
@@ -1486,6 +1521,77 @@ mod tests {
         assert_eq!(next.seq, 3);
         assert_eq!(next.counter, 3);
         assert_eq!(after.text(), "ABC");
+    }
+
+    #[test]
+    fn heterogeneous_and_time_varying_dmax_replicas_converge() {
+        // Dmax is a local allocation policy: replicas with different — and,
+        // for the adaptive one, changing — bounds must still converge,
+        // because Definition 2's order never consults the bound.
+        let mut replicas = [
+            Replica::new(1, cfg()),
+            Replica::new(2, ReplicaConfig::default()),
+            Replica::new(
+                3,
+                ReplicaConfig {
+                    dmax: 8,
+                    base: 10,
+                    depth: 3,
+                    adaptive_dmax: Some(crate::allocator::AdaptiveDmaxConfig {
+                        floor: 8,
+                        window: 8,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            ),
+        ];
+
+        let mut state = 0x1234_5678u32;
+        for step in 0..240 {
+            let target = (next_random(&mut state) as usize) % replicas.len();
+            let len = replicas[target].len();
+            if len == 0 || !next_random(&mut state).is_multiple_of(5) {
+                // The adaptive replica edits at its document boundary — the
+                // linear-drift workload its controller exists for — while the
+                // static replicas edit at random positions.
+                let index = if target == 2 {
+                    0
+                } else {
+                    (next_random(&mut state) as usize) % (len + 1)
+                };
+                let unit = u16::from(b'a' + (step % 26) as u8);
+                replicas[target].local_insert(index, unit);
+            } else {
+                let index = (next_random(&mut state) as usize) % len;
+                replicas[target].local_delete(index);
+            }
+        }
+        assert!(
+            replicas[2].alloc.current_dmax() > 8,
+            "adaptive replica never adapted"
+        );
+
+        let mut all_ops: Vec<Op> = replicas
+            .iter()
+            .flat_map(|replica| replica.log.values().cloned())
+            .collect();
+        all_ops.sort_by_key(|op| (op.origin, op.seq));
+        for (target, replica) in replicas.iter_mut().enumerate() {
+            let mut order = all_ops.clone();
+            let mut shuffle = (target as u32 + 1) * 0x045d_9f3b;
+            for i in (1..order.len()).rev() {
+                let j = (next_random(&mut shuffle) as usize) % (i + 1);
+                order.swap(i, j);
+            }
+            for op in order {
+                replica.receive(op);
+            }
+            assert!(replica.pending.is_empty(), "replica {target} still pending");
+        }
+        let expected = replicas[0].text();
+        assert_eq!(replicas[1].text(), expected);
+        assert_eq!(replicas[2].text(), expected);
     }
 
     #[test]

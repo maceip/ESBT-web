@@ -3,13 +3,16 @@
 //! current document plus the delete log L (Scenario 2).
 
 use crate::clock::Version;
-use crate::codec::{read_weight, write_weight, Reader, MIN_WEIGHT_BYTES};
+use crate::codec::{
+    longest_common_prefix, read_weight_parts, write_uvarint, write_weight_parts, Reader,
+    SiteContext,
+};
 use crate::error::{EngineError, ErrorCode};
 use crate::limits::ResourceLimits;
 use crate::op::Op;
 use crate::update::{OperationRef, Update};
 use crate::weight::{SiteId, Weight};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 const SNAPSHOT_MAGIC: &[u8; 4] = b"ESBS";
 const FULL_SNAPSHOT_MAGIC: &[u8; 4] = b"ESBF";
@@ -19,8 +22,19 @@ const MESSAGE_MAGIC: &[u8; 4] = b"ESBM";
 ///
 /// There is intentionally no legacy fallback: marks has no released data or
 /// clients, so an incompatible format should fail explicitly instead of being
-/// guessed from bytes.
-pub const ENGINE_FORMAT_VERSION: u16 = 1;
+/// guessed from bytes. Version 2 introduced the Extension 2 compact
+/// identifier format (site dictionary, canonical varints, implicit defaults,
+/// front-coded sequence paths in snapshots); version 3 extends the same
+/// treatment to update payloads: a per-update site dictionary replaces the
+/// repeated 16-byte origins, operations are self-delimiting varint records,
+/// and sequence paths are front-coded across the canonically sorted
+/// operation list.
+pub const ENGINE_FORMAT_VERSION: u16 = 3;
+
+/// Smallest possible encoded atom: flags, p, q, site index, unit, counter.
+const MIN_ATOM_BYTES: usize = 7;
+/// Smallest possible encoded delete-log entry: flags, p, q, site, counter.
+const MIN_DELETE_BYTES: usize = 5;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Atom {
@@ -45,6 +59,19 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    /// Sorted, strictly ascending table of every site owning a weight in
+    /// this snapshot. Both weight lists reference it by varint index.
+    fn site_table(&self) -> Vec<SiteId> {
+        let mut sites = BTreeSet::new();
+        for atom in &self.atoms {
+            sites.insert(atom.weight.site);
+        }
+        for (weight, _) in &self.delete_log {
+            sites.insert(weight.site);
+        }
+        sites.into_iter().collect()
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let mut b = Vec::new();
         b.extend_from_slice(SNAPSHOT_MAGIC);
@@ -52,17 +79,35 @@ impl Snapshot {
         let insertions = self.insertions.encode();
         b.extend_from_slice(&(insertions.len() as u32).to_le_bytes());
         b.extend_from_slice(&insertions);
-        b.extend_from_slice(&(self.atoms.len() as u32).to_le_bytes());
+
+        let sites = self.site_table();
+        write_uvarint(&mut b, sites.len() as u64);
+        for site in &sites {
+            b.extend_from_slice(&site.to_le_bytes());
+        }
+
+        // Atoms are canonically sorted by weight, so consecutive sequence
+        // paths share long prefixes (typing runs share their entire root).
+        // Front-code each path against its predecessor (Extension 2).
+        write_uvarint(&mut b, self.atoms.len() as u64);
+        let mut previous_path: &[u32] = &[];
         for a in &self.atoms {
-            write_weight(&mut b, &a.weight);
+            let shared = longest_common_prefix(previous_path, &a.weight.sc);
+            write_weight_parts(&mut b, &a.weight, SiteContext::Table(&sites), Some(shared));
             b.extend_from_slice(&a.unit.to_le_bytes());
-            b.extend_from_slice(&a.counter.to_le_bytes());
+            write_uvarint(&mut b, a.counter);
+            previous_path = &a.weight.sc;
         }
-        b.extend_from_slice(&(self.delete_log.len() as u32).to_le_bytes());
+
+        write_uvarint(&mut b, self.delete_log.len() as u64);
+        let mut previous_path: &[u32] = &[];
         for (w, c) in &self.delete_log {
-            write_weight(&mut b, w);
-            b.extend_from_slice(&c.to_le_bytes());
+            let shared = longest_common_prefix(previous_path, &w.sc);
+            write_weight_parts(&mut b, w, SiteContext::Table(&sites), Some(shared));
+            write_uvarint(&mut b, *c);
+            previous_path = &w.sc;
         }
+
         let ve = self.version.encode();
         b.extend_from_slice(&(ve.len() as u32).to_le_bytes());
         b.extend_from_slice(&ve);
@@ -93,7 +138,29 @@ impl Snapshot {
         let insertion_length = reader.u32()? as usize;
         let insertions = Version::decode_with_limits(reader.take(insertion_length)?, limits)?;
 
-        let na = reader.u32()? as usize;
+        let site_count = reader.uvarint()? as usize;
+        if site_count > limits.max_version_sites || site_count > reader.remaining() / 16 {
+            return Err(EngineError::new(
+                ErrorCode::TooManyVersionSites,
+                "snapshot site table exceeds its bounds",
+            ));
+        }
+        let mut sites = Vec::with_capacity(site_count);
+        let mut previous_site = None;
+        for _ in 0..site_count {
+            let site = reader.u128()?;
+            if site == 0 || previous_site.is_some_and(|previous| previous >= site) {
+                return Err(EngineError::new(
+                    ErrorCode::NonCanonicalEncoding,
+                    "snapshot site table is zero, duplicated, or out of order",
+                ));
+            }
+            previous_site = Some(site);
+            sites.push(site);
+        }
+        let mut referenced_sites = vec![false; sites.len()];
+
+        let na = reader.uvarint()? as usize;
         if na > limits.max_snapshot_items {
             return Err(EngineError::new(
                 ErrorCode::TooManySnapshotItems,
@@ -102,15 +169,24 @@ impl Snapshot {
         }
         // Bound the allocation by
         // the bytes actually present before trusting the declared count.
-        if na > reader.remaining() / (MIN_WEIGHT_BYTES + 10) {
+        if na > reader.remaining() / MIN_ATOM_BYTES {
             return Err(EngineError::malformed("impossible snapshot atom count"));
         }
         let mut atoms = Vec::with_capacity(na);
         let mut previous_weight: Option<Weight> = None;
+        let mut previous_path: Vec<u32> = Vec::new();
         for _ in 0..na {
-            let w = read_weight(&mut reader, limits)?;
+            let w = read_weight_parts(
+                &mut reader,
+                limits,
+                SiteContext::Table(&sites),
+                Some(&previous_path),
+            )?;
+            if let Ok(index) = sites.binary_search(&w.site) {
+                referenced_sites[index] = true;
+            }
             let unit = reader.u16()?;
-            let c = reader.u64()?;
+            let c = reader.uvarint()?;
             if c == 0
                 || previous_weight
                     .as_ref()
@@ -122,6 +198,7 @@ impl Snapshot {
                 ));
             }
             previous_weight = Some(w.clone());
+            previous_path = w.sc.clone();
             atoms.push(Atom {
                 weight: w,
                 unit,
@@ -129,7 +206,7 @@ impl Snapshot {
             });
         }
 
-        let nd = reader.u32()? as usize;
+        let nd = reader.uvarint()? as usize;
         let total_items = na.checked_add(nd).ok_or_else(|| {
             EngineError::new(ErrorCode::IntegerOverflow, "snapshot item count overflow")
         })?;
@@ -139,16 +216,26 @@ impl Snapshot {
                 "snapshot delete log exceeds resource policy",
             ));
         }
-        if nd > reader.remaining() / (MIN_WEIGHT_BYTES + 8) {
+        if nd > reader.remaining() / MIN_DELETE_BYTES {
             return Err(EngineError::malformed(
                 "impossible snapshot delete-log count",
             ));
         }
         let mut delete_log = Vec::with_capacity(nd);
         let mut previous_delete: Option<(Weight, u64)> = None;
+        let mut previous_path: Vec<u32> = Vec::new();
         for _ in 0..nd {
-            let w = read_weight(&mut reader, limits)?;
-            let c = reader.u64()?;
+            let w = read_weight_parts(
+                &mut reader,
+                limits,
+                SiteContext::Table(&sites),
+                Some(&previous_path),
+            )?;
+            if let Ok(index) = sites.binary_search(&w.site) {
+                referenced_sites[index] = true;
+            }
+            let c = reader.uvarint()?;
+            previous_path = w.sc.clone();
             let item = (w, c);
             if c == 0
                 || previous_delete
@@ -162,6 +249,12 @@ impl Snapshot {
             }
             previous_delete = Some(item.clone());
             delete_log.push(item);
+        }
+        if referenced_sites.iter().any(|used| !used) {
+            return Err(EngineError::new(
+                ErrorCode::NonCanonicalEncoding,
+                "snapshot site table has unused entries",
+            ));
         }
 
         let vl = reader.u32()? as usize;

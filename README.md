@@ -1,119 +1,68 @@
-# ESBT
+# esbt
 
-Sequence CRDT from Mechaoui & Imine, [arXiv:2607.28101](https://arxiv.org/abs/2607.28101).
+a sequence crdt for collaborative text editing, built from the extended
+stern–brocot tree paper by mechaoui & imine
+([arxiv:2607.28101](https://arxiv.org/abs/2607.28101)). concurrent changes
+made on different devices merge automatically, without requiring any central
+server, and every replica converges to the same document.
 
-Rust core, `wasm32-unknown-unknown`, and a production one-document browser
-adapter. The Rust/Wasm implementation is the sole production engine. The
-private package in [`ts/`](ts/) is frozen as a behavioral reference only; Marks
-must not import or ship it as an independent engine.
+the engine is written in rust and compiles to webassembly for the browser.
+it is network-agnostic: updates and snapshots are plain bytes you can send
+over any transport and apply in any order. deleted text is removed for real —
+no tombstones — and identifier growth stays bounded even under heavy
+concurrent editing.
 
-`extensions.md` is **not** in this tree (adaptive \(D_{\max}\), compact `sc`,
-Yjs/Automerge, partition-recovery study).
+## what's in the box
 
-## Repository boundary
+- `src/` — the rust core: bounded identifier allocation, a red–black tree
+  document, causal delivery, undo, snapshots, and exact, non-panicking
+  decoding of every byte that crosses the wire
+- `web/esbt-document.js` — the browser adapter over the `esbt_doc_*` wasm
+  abi: transactions, anchors, undo/redo, reconnect deltas, and configurable
+  documents
+- `ts/` — a frozen typescript reference, kept only for behavioral
+  comparison; do not ship it
+- `docs/` — design notes: the paper's four future-work extensions
+  (implemented here, with measurements) and the client integration guide
 
-This repository owns collaboration-engine concerns only:
+## how it works
 
-- ESBT weights, operations, ordering, and allocator;
-- gap-aware version summaries;
-- UTF-16 document semantics;
-- operation and snapshot encoding;
-- exact, bounded, non-panicking decoding;
-- intention-preserving concurrent insertion behavior;
-- snapshot merge and compaction semantics;
-- native Rust API;
-- browser Wasm API;
-- local-operation and undo primitives needed by the Wasm adapter;
-- native/Wasm golden fixtures;
-- convergence, permutation, malformed-input, and performance tests; and
-- reproducible Wasm packaging and engine CI.
+every inserted character gets a unique, immutable identifier — a bounded
+rational fraction plus small disambiguation layers — so concurrent inserts
+at the same position resolve deterministically on every replica. local
+changes apply immediately; remote changes merge when they arrive. a
+gap-aware version summary tells peers exactly which operations are missing,
+so reconnecting after going offline exchanges only the difference. when
+history has been compacted away, a compact snapshot becomes the new base and
+your unsynced local edits are replayed on top, not lost.
 
-It does not own principals, sessions, devices as product identities, phone
-controllers, scratch workspaces as product records, ACLs or roles, share links,
-room tickets, comments, assets, HTTP cookies, databases, or the production
-WebSocket server.
+the engine owns only the crdt: identifiers, ordering, merging, and encoding.
+who is allowed to edit, where bytes are stored, and how they travel are your
+application's concerns.
 
-The ESBT core receives only an ESBT site identifier and operation bytes. It
-does not know who the person is or whether they are allowed to edit. The
-product boundary validates authority and actor-to-site binding before dispatch;
-ESBT still independently performs exact bounded structural decoding and
-validates its own operation invariants.
-
-## Paper claims → code
-
-| Claim | Where |
-|---|---|
-| Weight ⟨f, sn, sc, δ⟩, sentinels 0/1 and 1/0 | `src/weight.rs` |
-| Total order Def. 2 | `Weight::cmp` |
-| NEWSEQ Alg. 1 + examples | `src/newseq.rs` |
-| CREATE_WEIGHT Alg. 2, Tracker Def. 4 | `src/allocator.rs` |
-| Situations 1–3 | `src/verify.rs` |
-| Bounded fractions (Thm. 2: max(p,q) < Dmax) | `Allocator::mediant_fits` |
-| RB-tree document, rank by index | `src/rbtree.rs` |
-| INS(ω,e,c) / DEL(ω,c) | `src/op.rs` |
-| Alg. 3 Q, L, CounterMap, isCausallyReady | `src/replica.rs` |
-| Scenario 3 reuse distinguished by c | same |
-| Epidemic + join/leave | `src/snapshot.rs` + `web/mesh.js` |
-| Evaluation defaults base=2³¹−1, depth=256 | `ReplicaConfig` |
-
-## Marks qualification changes
-
-The Rust core is the intended production authority for marks. It deliberately
-includes the following corrections and product-level extensions beyond a
-literal transcription of the preprint:
-
-- version summaries retain a contiguous per-site prefix plus explicit higher
-  receipts, so reconnect can repair out-of-order sequence gaps;
-- every allocator candidate is checked strictly between its immediate
-  neighbors, with an unbounded NEWSEQ retry and typed exhaustion when that
-  exact gap has no representable identifier;
-- consecutive local insertions reserve a site-specific ESBT path prefix, so
-  concurrent typing runs remain contiguous rather than converging to a
-  character shuffle;
-- reused weights order their insertion counters: a newer reuse waits behind an
-  older live occupant, while an older reuse arriving late is suppressed;
-- document elements are UTF-16 code units, so Rust/Wasm indices exactly match
-  JavaScript strings and CodeMirror positions, including non-BMP emoji;
-- a causally closed compact snapshot can become a new base while retained
-  local operations are replayed; the merge fails explicitly if the snapshot
-  has gaps or required local history has already been compacted;
-- persisted snapshots and mesh messages carry an explicit engine-format
-  version and exact checked decoding rejects malformed, trailing, or
-  non-canonical bytes.
-
-These changes preserve ESBT weights, ordering, operations, delete counters,
-snapshots, and replica merge semantics. The typing-run rule is an
-intention-preservation extension; it is not a claim of Fugue-style maximal
-non-interleaving. There is no legacy decoder because marks has no released
-clients or durable documents requiring compatibility.
-
-The `esbt_doc_*` ABI and [`web/esbt-document.js`](web/esbt-document.js) provide
-the production one-document boundary: opaque lifecycle, exact UTF-16 edits,
-transaction updates, atomic imports, snapshots, reconnect deltas, anchors,
-per-replica undo/redo, typed failures, and explicit Wasm allocation ownership.
-Marks owns persistence and transport around the canonical update bytes emitted
-by that boundary; it does not reimplement the CRDT in TypeScript.
-
-Algorithm 2 line 10 is typeset `p < Dmax **or** q < Dmax`. That admits
-unbounded denominators and contradicts line 9, Theorem 2, and Situation 1
-(3/7 rejected at Dmax=5). The implementation follows the theorem.
-
-The paper assumes *reliable* epidemic broadcast and never names QUIC or
-WebRTC. The page supplies that layer: BroadcastChannel, WebRTC data
-channels, hello/snapshot anti-entropy.
-
-## Run
+## quickstart
 
 ```bash
-cargo test --lib
-# if the volume is noexec:
-cp target/debug/deps/esbt-* /tmp/esbt-test && /tmp/esbt-test
+cargo test
 
-# Default artifact: production `esbt_doc_*` API only.
 cargo build --release --target wasm32-unknown-unknown
 cp target/wasm32-unknown-unknown/release/esbt.wasm web/
 python3 -m http.server -d web 8080
 ```
 
-Open `http://localhost:8080/?room=demo` in two browsers. Same-origin tabs
-sync by themselves. Distinct machines: offer / accept / apply SDP.
+open `http://localhost:8080/?room=demo` in two browsers and type. same-origin
+tabs sync by themselves; distinct machines exchange webrtc offers.
+
+## learn more
+
+- [`docs/extension-considerations.md`](docs/extension-considerations.md) —
+  adaptive allocation bounds, the compact wire formats, pluggable allocation
+  strategies and order-preserving keys, and the deterministic
+  partition/recovery study, each with recorded measurements
+- [`docs/marks-client-plumbing.md`](docs/marks-client-plumbing.md) — how a
+  client should configure documents, bound memory with history compaction,
+  batch changes into transactions, and recover from disconnection or crash
+- the implementation follows the paper's formal statements where the typeset
+  pseudocode contradicts them, and documents every deliberate deviation
+  (typing-run contiguity, gap-aware receipts, utf-16 document indices) in
+  the files above
