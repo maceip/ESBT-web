@@ -7,7 +7,10 @@ use crate::replica::Replica;
 use crate::weight::Weight;
 
 const ANCHOR_MAGIC: &[u8; 4] = b"ESBA";
-const ANCHOR_FORMAT_VERSION: u16 = 1;
+const ANCHOR_FORMAT_VERSION: u16 = 2;
+
+/// Anchors are self-contained, so their weights carry an inline site.
+const NO_SITE_CONTEXT: crate::weight::SiteId = 0;
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -114,7 +117,7 @@ impl Anchor {
             AnchorTarget::End => out.push(2),
             AnchorTarget::Item { weight, counter } => {
                 out.push(3);
-                write_weight(&mut out, weight);
+                write_weight(&mut out, weight, NO_SITE_CONTEXT);
                 out.extend_from_slice(&counter.to_le_bytes());
             }
         }
@@ -159,7 +162,7 @@ impl Anchor {
             1 => AnchorTarget::Start,
             2 => AnchorTarget::End,
             3 => {
-                let weight = read_weight(&mut reader, limits)?;
+                let weight = read_weight(&mut reader, limits, NO_SITE_CONTEXT)?;
                 let counter = reader.u64()?;
                 if counter == 0 {
                     return Err(EngineError::new(
