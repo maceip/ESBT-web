@@ -36,6 +36,14 @@ Every row was taken from a call site in marks (`client/src/collab/loro-engine.ts
 | `new UndoManager(doc, {})` (loro) / `new Y.UndoManager(text)` | `new UndoManager(doc)` | covered |
 | `canUndo` / `canRedo` / `undo` / `redo` / `destroy` | same | covered |
 | **Keystroke grouping** — Loro's merge interval and Yjs's `captureTimeout` group a typing burst into one undo step | *not in the original contract* | **gap → closed.** `UndoManagerOptions.mergeIntervalMs` added (default 0 = strict one-transact-one-step; marks passes 500). Without it, Mod-Z undoes one character at a time and the smoke test's "undo reverts my own edit" loops out. |
+| `new UndoManager(doc, { excludeOriginPrefixes: [COMMENT_ORIGIN] })` — comment writes must never be undoable | *not in the original contract* | **gap → closed.** `UndoManagerOptions.excludeOriginPrefixes` added with Loro's semantics, and map ops are additionally skipped inside undo application. |
+
+## Comments (the browser-surface feature)
+
+| marks called | Contract | Status |
+| --- | --- | --- |
+| `doc.getMap(COMMENTS_MAP).set(id, json)` / `.delete(id)` / `.entries()` / `.toJSON()` (loro) — `Y.Map` equivalent — comment records ride the document CRDT | *not in the original contract* (it only sketched a server-side table) | **gap → closed.** `EsbtDoc.mapSet` / `mapDelete` / `mapGet` / `mapEntries`: a keyed last-writer-wins register map riding the same oplog, snapshots (both flavours — cold opens must paint comments), version vectors, and update deltas as the text. Values are opaque strings; highest (lamport, site) wins; deletes leave mergeable tombstones. |
+| `text.getCursor(pos)` → `Cursor.encode()`, `doc.getCursorPos(Cursor.decode(bytes))` — stable comment anchors across edits | anchors were already this audit's addition | **covered.** `indexToAnchor(pos)` → `EsbtAnchor` (JSON-encode for the comment record's cursor strings), `anchorToIndex` to re-resolve. Deleted anchors resolve to their weight's lower bound, mirroring Loro cursor recovery. |
 
 ## Presence
 

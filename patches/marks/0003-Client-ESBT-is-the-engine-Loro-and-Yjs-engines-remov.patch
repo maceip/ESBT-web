@@ -1,35 +1,39 @@
-From b61857eaaebe438439462c1b234b819b76b4e43b Mon Sep 17 00:00:00 2001
+From f39a67343bf28cc486adf8d211d5e6c0abba0399 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
-Date: Fri, 21 Aug 2026 23:38:39 +0000
-Subject: [PATCH 3/5] Client: ESBT is the engine; Loro and Yjs engines removed
+Date: Sat, 22 Aug 2026 00:01:01 +0000
+Subject: [PATCH 3/6] Client: ESBT is the engine; Loro and Yjs engines removed
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
 
-EsbtEngine keeps the loro-engine shape — IndexedDB warm open, shallow HTTP
-snapshot, one WebSocket with a version vector on the URL, reconnect
-backoff, deletion close code — on the @marks/esbt replica, with per-peer
-undo grouped over a 500 ms window. Remote carets and selections move to a
-new presence extension (collab/presence.ts) that publishes the contract's
-${siteId}-cm-user / ${siteId}-cm-sel keys on a 15 s heartbeat and renders
-peers as CodeMirror decorations, replacing loro-codemirror and
-y-codemirror.next. Single-engine UI (no engine picker), legacy loro/yjs
-rows are listed but refused with an explanation, and the benchmark page
-now measures ESBT. loro-crdt, loro-codemirror, yjs, y-codemirror.next,
-y-indexeddb and @hocuspocus/provider leave the dependency tree; the Vite
-optimizeDeps exclusion for wasm-bindgen glue goes with them.
+EsbtEngine keeps the loro-engine shape — IndexedDB warm open behind a
+persist lock, network-aware shallow HTTP snapshot, one WebSocket with a
+version vector on the URL, reconnect backoff, deletion close code,
+cross-tab BroadcastChannel sync, hydration state — on the @marks/esbt
+replica, with per-peer undo grouped over a 500 ms window and comment
+writes excluded from Mod-Z by origin. Comments ride the engine's keyed
+LWW map with weight-stable anchors standing in for Loro Cursors; the
+shared quote resolver stays as the fallback. Remote carets and
+selections move to a new presence extension (collab/presence.ts) that
+publishes the contract's ${siteId}-cm-user / ${siteId}-cm-sel keys on a
+15 s heartbeat and renders peers as CodeMirror decorations, replacing
+loro-codemirror and y-codemirror.next. Single-engine UI (no engine
+picker), legacy loro/yjs rows are listed but refused with an
+explanation, and the benchmark page now measures ESBT. loro-crdt,
+loro-codemirror, yjs, y-codemirror.next, y-indexeddb and
+@hocuspocus/provider leave the dependency tree.
 ---
  client/package.json                           |   9 +-
- client/src/App.tsx                            |  32 ++-
- .../collab/{loro-engine.ts => esbt-engine.ts} | 119 ++++----
+ client/src/App.tsx                            |  34 +-
+ .../collab/{loro-engine.ts => esbt-engine.ts} | 268 ++++++------
  client/src/collab/index.ts                    |  25 +-
- client/src/collab/presence.ts                 | 194 ++++++++++++++
- client/src/collab/types.ts                    |  13 +-
- client/src/collab/yjs-engine.ts               | 188 -------------
- client/src/components/EmptyState.tsx          |  32 +--
- client/src/components/Sidebar.tsx             |  38 +--
+ client/src/collab/presence.ts                 | 194 +++++++++
+ client/src/collab/types.ts                    |  11 +-
+ client/src/collab/yjs-engine.ts               | 382 ------------------
+ client/src/components/EmptyState.tsx          |  32 +-
+ client/src/components/Sidebar.tsx             |  38 +-
  client/src/components/TopBar.tsx              |   4 +-
- client/src/hooks/useDocumentMeta.ts           |  22 +-
+ client/src/hooks/useDocumentMeta.ts           |  28 +-
  client/src/hooks/useDocuments.ts              |  16 +-
  client/src/hooks/useSession.ts                |  12 +-
  client/src/lib/api.ts                         |  13 +-
@@ -37,15 +41,12 @@ optimizeDeps exclusion for wasm-bindgen glue goes with them.
  client/src/pages/Benchmark.tsx                |  25 +-
  client/src/styles/base.css                    |   8 +-
  client/src/styles/editor.css                  |  25 +-
- client/src/workers/bench.worker.ts            | 132 ++-------
+ client/src/workers/bench.worker.ts            | 132 ++----
  client/vite.config.ts                         |   4 -
- esbt/src/index.ts                             |   5 +-
- package-lock.json                             | 253 ++----------------
+ package-lock.json                             | 241 +----------
  package.json                                  |   8 +-
- server/package.json                           |   7 +-
- server/src/store.ts                           |   4 +-
- 25 files changed, 430 insertions(+), 764 deletions(-)
- rename client/src/collab/{loro-engine.ts => esbt-engine.ts} (82%)
+ 22 files changed, 494 insertions(+), 1021 deletions(-)
+ rename client/src/collab/{loro-engine.ts => esbt-engine.ts} (77%)
  create mode 100644 client/src/collab/presence.ts
  delete mode 100644 client/src/collab/yjs-engine.ts
 
@@ -83,7 +84,7 @@ index edab8c8..3f5e828 100644
    "devDependencies": {
      "@types/react": "^19.2.0",
 diff --git a/client/src/App.tsx b/client/src/App.tsx
-index 61e7664..32469f9 100644
+index 0a191c0..996ab89 100644
 --- a/client/src/App.tsx
 +++ b/client/src/App.tsx
 @@ -1,7 +1,6 @@
@@ -91,21 +92,24 @@ index 61e7664..32469f9 100644
  import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
  import { loadUser } from './collab';
 -import type { EngineName } from './collab/types';
+ import { CommentsDrawer } from './components/CommentsDrawer';
+ import { ContextMenu } from './components/ContextMenu';
  import { EmptyState } from './components/EmptyState';
- import type { CursorInfo } from './components/EditorPane';
- import { Icon, icons } from './components/Icon';
-@@ -50,8 +49,8 @@ export function App() {
+@@ -55,8 +54,11 @@ export function App() {
  
    const documents = useDocuments();
    const docId = route.name === 'document' ? route.id : null;
 -  const { meta, engine, resolved } = useDocumentMeta(docId);
--  const { session, status, peers } = useSession(resolved ? docId : null, engine, user);
-+  const { engine, supported, resolved } = useDocumentMeta(docId);
-+  const { session, status, peers } = useSession(resolved && supported ? docId : null, user);
+-  const { session, status, peers, comments } = useSession(resolved ? docId : null, engine, user);
++  const { meta, engine, supported, resolved } = useDocumentMeta(docId);
++  const { session, status, peers, comments } = useSession(
++    resolved && supported ? docId : null,
++    user,
++  );
  
    const scrollSync = useMemo(() => new ScrollSync(), []);
    const tracker = useRef(new LatencyTracker(240));
-@@ -125,13 +124,10 @@ export function App() {
+@@ -134,13 +136,10 @@ export function App() {
      [navigate],
    );
  
@@ -123,24 +127,16 @@ index 61e7664..32469f9 100644
  
    const removeDocument = useCallback(
      async (id: string) => {
-@@ -170,7 +166,6 @@ export function App() {
-   // is fresher than the metadata fetched when the document was opened.
-   const title =
-     documents.documents.find((entry) => entry.id === docId)?.title ??
--    meta?.title ??
-     (docId ? 'Untitled' : 'marks');
- 
-   useEffect(() => {
-@@ -185,7 +180,7 @@ export function App() {
-           activeId={docId}
+@@ -195,7 +194,7 @@ export function App() {
            loading={documents.loading}
+           stale={documents.stale}
            onOpen={openDocument}
 -          onCreate={(nextEngine) => void createDocument(nextEngine)}
 +          onCreate={() => void createDocument()}
            onDelete={(id) => void removeDocument(id)}
            onOpenBenchmark={() => navigate({ name: 'benchmark' })}
          />
-@@ -214,6 +209,17 @@ export function App() {
+@@ -227,6 +226,17 @@ export function App() {
            <Suspense fallback={<div className="empty-state">Loading benchmark…</div>}>
              <Benchmark onBack={() => navigate({ name: 'home' })} />
            </Suspense>
@@ -156,10 +152,10 @@ index 61e7664..32469f9 100644
 +            </div>
 +          </div>
          ) : session ? (
-           <Workspace
-             session={session}
-@@ -230,7 +236,7 @@ export function App() {
-           </div>
+           <div
+             className="workspace-shell"
+@@ -260,7 +270,7 @@ export function App() {
+           <OpeningShell cached={Boolean(meta)} offline={surface.network === 'offline'} />
          ) : (
            <EmptyState
 -            onCreate={(nextEngine) => void createDocument(nextEngine)}
@@ -168,19 +164,36 @@ index 61e7664..32469f9 100644
            />
          )}
 diff --git a/client/src/collab/loro-engine.ts b/client/src/collab/esbt-engine.ts
-similarity index 82%
+similarity index 77%
 rename from client/src/collab/loro-engine.ts
 rename to client/src/collab/esbt-engine.ts
-index 93885ef..4b53b7a 100644
+index 1048eb4..c69deff 100644
 --- a/client/src/collab/loro-engine.ts
 +++ b/client/src/collab/esbt-engine.ts
-@@ -1,10 +1,10 @@
+@@ -1,14 +1,13 @@
  import { Annotation, Prec, type Extension } from '@codemirror/state';
  import { ViewPlugin, keymap, type EditorView } from '@codemirror/view';
  import { get as idbGet, set as idbSet } from 'idb-keyval';
 -import { LoroEphemeralPlugin } from 'loro-codemirror';
--import { EphemeralStore, LoroDoc, UndoManager, VersionVector } from 'loro-crdt';
-+import { EphemeralStore, EsbtDoc, UndoManager, VersionVector } from '@marks/esbt';
+-import { Cursor, EphemeralStore, LoroDoc, UndoManager, VersionVector } from 'loro-crdt';
++import { EphemeralStore, EsbtDoc, UndoManager, VersionVector, type EsbtAnchor } from '@marks/esbt';
+ import {
+   COMMENT_ORIGIN,
+-  COMMENTS_MAP,
+   createCommentId,
+   decodeBytes,
+   encodeBytes,
++  fetchWithTimeout,
+   parseComment,
+   persistLockName,
+   readCommentMap,
+@@ -19,11 +18,11 @@ import {
+   TabChannel,
+   tabChannelName,
+   withPersistLock,
+-  fetchWithTimeout,
+   type CommentRecord,
+ } from '../browser';
 +import { HEARTBEAT_MS, esbtPresence } from './presence';
  import { MSG_EPHEMERAL, MSG_SERVER_VV, MSG_SNAPSHOT, MSG_SYNCED, MSG_UPDATE, frame, toBase64Url } from './protocol';
 -import { TEXT_KEY, type CollabSession, type ConnectionStatus, type EngineStats, type Peer, type SessionOptions } from './types';
@@ -188,7 +201,7 @@ index 93885ef..4b53b7a 100644
  
  const EPHEMERAL_TIMEOUT_MS = 30_000;
  const LOCAL_SAVE_DEBOUNCE_MS = 800;
-@@ -16,10 +16,10 @@ const CLOSE_DOCUMENT_DELETED = 4404;
+@@ -35,10 +34,10 @@ const CLOSE_DOCUMENT_DELETED = 4404;
  /** Version vectors above this size are not worth putting in a URL. */
  const MAX_VV_QUERY_BYTES = 4_096;
  
@@ -202,7 +215,7 @@ index 93885ef..4b53b7a 100644
  
  /** Marks an editor transaction as replaying the CRDT, not as a user edit. */
  const fromCrdt = Annotation.define<boolean>();
-@@ -34,18 +34,20 @@ const fromCrdt = Annotation.define<boolean>();
+@@ -53,29 +52,39 @@ const fromCrdt = Annotation.define<boolean>();
  const EDITOR_ORIGIN = 'editor';
  
  /**
@@ -215,8 +228,10 @@ index 93885ef..4b53b7a 100644
 - * document load times flat as edit history grows.
 + * Every keystroke applies to the local replica synchronously — no WebAssembly
 + * boundary, no worker round-trip — and the update bytes it emits go to the
-+ * room over one WebSocket per document, the same wire shape the Loro engine
-+ * used (tag byte + payload, version-vector deltas on reconnect).
++ * room over one WebSocket per document (tag byte + payload, version-vector
++ * deltas on reconnect) and to sibling tabs over a BroadcastChannel. Comments
++ * ride the document in the engine's keyed LWW map with weight-stable anchors,
++ * so they sync, work offline, and survive merges.
   */
 -export class LoroEngine implements CollabSession {
 -  readonly engine = 'loro' as const;
@@ -230,20 +245,49 @@ index 93885ef..4b53b7a 100644
    private readonly ephemeral = new EphemeralStore(EPHEMERAL_TIMEOUT_MS);
    private readonly undoManager: UndoManager;
    private readonly user: SessionOptions['user'];
-@@ -53,6 +55,7 @@ export class LoroEngine implements CollabSession {
++  private readonly tabs: TabChannel;
+ 
    private socket: WebSocket | null = null;
    private reconnectDelay = RECONNECT_MIN_MS;
    private reconnectTimer: number | null = null;
 +  private presenceHeartbeat: number | null = null;
++  private snapshotReplyTimer: number | null = null;
++  private lastServerVV: Uint8Array | null = null;
    private destroyed = false;
++  private isHydrated = false;
  
    private currentStatus: ConnectionStatus = 'connecting';
-@@ -68,18 +71,13 @@ export class LoroEngine implements CollabSession {
+   private cachedPeers: Peer[] = [];
++  private cachedComments: CommentRecord[] = [];
+   private counters = { received: 0, sent: 0, snapshotBytes: 0 };
+ 
+   private saveTimer: number | null = null;
+@@ -85,17 +94,16 @@ export class LoroEngine implements CollabSession {
+   private readonly peerListeners = new Set<(peers: Peer[]) => void>();
+   private readonly commentListeners = new Set<(comments: CommentRecord[]) => void>();
+   private readonly hydratedListeners = new Set<() => void>();
+-  private cachedComments: CommentRecord[] = [];
+-  private isHydrated = false;
+-  private lastServerVV: Uint8Array | null = null;
+-  private snapshotReplyTimer: number | null = null;
+-  private readonly tabs: TabChannel;
+ 
    constructor({ docId, user }: SessionOptions) {
      this.docId = docId;
      this.user = user;
--    this.undoManager = new UndoManager(this.doc, {});
-+    this.undoManager = new UndoManager(this.doc, { mergeIntervalMs: UNDO_MERGE_MS });
+-    this.undoManager = new UndoManager(this.doc, { excludeOriginPrefixes: [COMMENT_ORIGIN] });
+-    this.tabs = new TabChannel(tabChannelName('loro', docId), {
++    this.undoManager = new UndoManager(this.doc, {
++      mergeIntervalMs: UNDO_MERGE_MS,
++      // Mod-Z must never delete a comment.
++      excludeOriginPrefixes: [COMMENT_ORIGIN],
++    });
++    this.tabs = new TabChannel(tabChannelName('esbt', docId), {
+       onHello: () => this.scheduleTabSnapshot(),
+       onRequestSnapshot: () => this.scheduleTabSnapshot(),
+       onUpdate: (bytes) => this.importFromTab(bytes, 'update'),
+@@ -103,15 +111,10 @@ export class LoroEngine implements CollabSession {
+     });
  
      this.extension = [
 -      // The binding's cursor and selection layers, which are the parts of
@@ -262,7 +306,7 @@ index 93885ef..4b53b7a 100644
        this.syncExtension(),
        this.undoExtensions(),
      ];
-@@ -94,12 +92,24 @@ export class LoroEngine implements CollabSession {
+@@ -130,6 +133,11 @@ export class LoroEngine implements CollabSession {
        this.ephemeral.subscribeLocalUpdates((bytes) => this.send(MSG_EPHEMERAL, bytes)),
      );
  
@@ -273,7 +317,8 @@ index 93885ef..4b53b7a 100644
 +
      window.addEventListener('online', this.handleOnline);
      window.addEventListener('offline', this.handleOffline);
- 
+     document.addEventListener('visibilitychange', this.handleVisibility);
+@@ -138,6 +146,13 @@ export class LoroEngine implements CollabSession {
      void this.start();
    }
  
@@ -287,7 +332,7 @@ index 93885ef..4b53b7a 100644
    private redo(): boolean {
      if (this.undoManager.canRedo()) this.undoManager.redo();
      return true;
-@@ -110,7 +120,7 @@ export class LoroEngine implements CollabSession {
+@@ -148,7 +163,7 @@ export class LoroEngine implements CollabSession {
     * it, so the cursor, scroll position and any selection survive.
     */
    private reconcile(view: EditorView): void {
@@ -296,7 +341,7 @@ index 93885ef..4b53b7a 100644
      const current = view.state.doc.toString();
      if (current === target) return;
  
-@@ -136,14 +146,10 @@ export class LoroEngine implements CollabSession {
+@@ -174,14 +189,10 @@ export class LoroEngine implements CollabSession {
    }
  
    /**
@@ -315,7 +360,7 @@ index 93885ef..4b53b7a 100644
     */
    private syncExtension(): Extension {
      return ViewPlugin.define((view) => {
-@@ -170,15 +176,15 @@ export class LoroEngine implements CollabSession {
+@@ -208,15 +219,15 @@ export class LoroEngine implements CollabSession {
            if (!update.docChanged) return;
            if (update.transactions.some((transaction) => transaction.annotation(fromCrdt))) return;
  
@@ -340,7 +385,7 @@ index 93885ef..4b53b7a 100644
          },
          destroy: () => {
            disposed = true;
-@@ -189,8 +195,8 @@ export class LoroEngine implements CollabSession {
+@@ -227,8 +238,8 @@ export class LoroEngine implements CollabSession {
    }
  
    /**
@@ -351,7 +396,7 @@ index 93885ef..4b53b7a 100644
     */
    private undoExtensions(): Extension {
      return Prec.high(
-@@ -213,23 +219,15 @@ export class LoroEngine implements CollabSession {
+@@ -251,23 +262,15 @@ export class LoroEngine implements CollabSession {
    /* ---------------------------------------------------------------- reads */
  
    getText(): string {
@@ -378,7 +423,67 @@ index 93885ef..4b53b7a 100644
    }
  
    status(): ConnectionStatus {
-@@ -306,7 +304,7 @@ export class LoroEngine implements CollabSession {
+@@ -297,22 +300,24 @@ export class LoroEngine implements CollabSession {
+     return () => this.peerListeners.delete(listener);
+   }
+ 
++  /* ------------------------------------------------------------- comments */
++
+   comments(): CommentRecord[] {
+     return this.cachedComments;
+   }
+ 
+   addComment(input: { from: number; to: number; quote: string; body: string }): string {
+     const id = createCommentId();
+-    const text = this.doc.getText(TEXT_KEY);
++    // Weight-stable anchors: the ESBT equivalent of a Loro Cursor. They
++    // survive concurrent edits anywhere else in the document; quote+offset
++    // remain as the fallback the shared resolver understands.
+     let startCursor: string | undefined;
+     let endCursor: string | undefined;
+     try {
+-      const start = text.getCursor(input.from);
+-      const end = text.getCursor(input.to);
+-      if (start) startCursor = encodeBytes(start.encode());
+-      if (end) endCursor = encodeBytes(end.encode());
++      startCursor = encodeAnchor(this.doc.indexToAnchor(input.from));
++      endCursor = encodeAnchor(this.doc.indexToAnchor(input.to));
+     } catch {
+-      // Cursors are an optimisation; quote+offset still work.
++      // Anchors are an optimisation; quote+offset still work.
+     }
+ 
+     const record: CommentRecord = {
+@@ -328,21 +333,21 @@ export class LoroEngine implements CollabSession {
+       startCursor,
+       endCursor,
+     };
+-    this.doc.getMap(COMMENTS_MAP).set(id, serializeComment(record));
+-    this.doc.commit({ origin: COMMENT_ORIGIN });
++    this.doc.transact(() => this.doc.mapSet(id, serializeComment(record)), COMMENT_ORIGIN);
+     return id;
+   }
+ 
+   resolveComment(id: string): void {
+-    const existing = this.commentById(id);
++    const existing = parseComment(this.doc.mapGet(id));
+     if (!existing || existing.resolved) return;
+-    this.doc.getMap(COMMENTS_MAP).set(id, serializeComment({ ...existing, resolved: true }));
+-    this.doc.commit({ origin: COMMENT_ORIGIN });
++    this.doc.transact(
++      () => this.doc.mapSet(id, serializeComment({ ...existing, resolved: true })),
++      COMMENT_ORIGIN,
++    );
+   }
+ 
+   deleteComment(id: string): void {
+-    this.doc.getMap(COMMENTS_MAP).delete(id);
+-    this.doc.commit({ origin: COMMENT_ORIGIN });
++    this.doc.transact(() => this.doc.mapDelete(id), COMMENT_ORIGIN);
+   }
+ 
+   onCommentsChange(listener: (comments: CommentRecord[]) => void): () => void {
+@@ -419,7 +424,7 @@ export class LoroEngine implements CollabSession {
      if (this.destroyed) return;
  
      const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -387,7 +492,7 @@ index 93885ef..4b53b7a 100644
  
      // Tell the server what we already have so it can reply with a delta
      // instead of a full snapshot.
-@@ -327,7 +325,6 @@ export class LoroEngine implements CollabSession {
+@@ -440,7 +445,6 @@ export class LoroEngine implements CollabSession {
      socket.addEventListener('message', (event) => this.onMessage(event.data as ArrayBuffer));
      socket.addEventListener('open', () => {
        this.reconnectDelay = RECONNECT_MIN_MS;
@@ -395,7 +500,7 @@ index 93885ef..4b53b7a 100644
        this.send(MSG_EPHEMERAL, this.ephemeral.encodeAll());
      });
      socket.addEventListener('close', (event) => this.onDisconnect(socket, event.code));
-@@ -436,7 +433,7 @@ export class LoroEngine implements CollabSession {
+@@ -597,7 +601,7 @@ export class LoroEngine implements CollabSession {
    /* ------------------------------------------------------------ persistence */
  
    private get cacheKey(): string {
@@ -404,9 +509,55 @@ index 93885ef..4b53b7a 100644
    }
  
    private scheduleLocalSave(): void {
-@@ -473,8 +470,8 @@ export class LoroEngine implements CollabSession {
+@@ -619,7 +623,7 @@ export class LoroEngine implements CollabSession {
+       return;
+     }
+     try {
+-      await withPersistLock(persistLockName('loro', this.docId), async () => {
++      await withPersistLock(persistLockName('esbt', this.docId), async () => {
+         await idbSet(this.cacheKey, snapshot);
+       });
+     } catch {
+@@ -641,9 +645,45 @@ export class LoroEngine implements CollabSession {
+     for (const listener of this.statusListeners) listener(status);
    }
  
++  private markHydrated(): void {
++    if (this.isHydrated) return;
++    this.isHydrated = true;
++    this.emitComments();
++    for (const listener of this.hydratedListeners) listener();
++  }
++
++  private emitComments(): void {
++    this.cachedComments = this.readComments();
++    for (const listener of this.commentListeners) listener(this.cachedComments);
++  }
++
++  private readComments(): CommentRecord[] {
++    const raw = readCommentMap(this.doc.mapEntries());
++    const text = this.getText();
++    return raw.map((comment) => {
++      const fromAnchors = this.rangeFromAnchors(comment);
++      const resolved = fromAnchors ?? resolveCommentRange(comment, text);
++      return resolved ? { ...comment, from: resolved.from, to: resolved.to } : comment;
++    });
++  }
++
++  private rangeFromAnchors(comment: CommentRecord): { from: number; to: number } | null {
++    if (!comment.startCursor || !comment.endCursor) return null;
++    try {
++      const start = decodeAnchor(comment.startCursor);
++      const end = decodeAnchor(comment.endCursor);
++      if (!start || !end) return null;
++      const from = this.doc.anchorToIndex(start);
++      const to = this.doc.anchorToIndex(end);
++      return { from: Math.min(from, to), to: Math.max(from, to) };
++    } catch {
++      return null;
++    }
++  }
++
    private refreshPeers(): void {
 -    const states = this.ephemeral.getAllStates() as Record<string, unknown>;
 -    const selfKey = userKey(this.doc.peerIdStr);
@@ -415,7 +566,7 @@ index 93885ef..4b53b7a 100644
      const peers: Peer[] = [];
  
      for (const [key, value] of Object.entries(states)) {
-@@ -492,7 +489,7 @@ export class LoroEngine implements CollabSession {
+@@ -661,7 +701,7 @@ export class LoroEngine implements CollabSession {
  
      if (!peers.some((peer) => peer.self)) {
        peers.unshift({
@@ -424,18 +575,96 @@ index 93885ef..4b53b7a 100644
          name: this.user.name,
          colorIndex: this.user.colorIndex,
          self: true,
-@@ -516,9 +513,11 @@ export class LoroEngine implements CollabSession {
-     window.removeEventListener('online', this.handleOnline);
-     window.removeEventListener('offline', this.handleOffline);
+@@ -674,9 +714,9 @@ export class LoroEngine implements CollabSession {
+   }
+ 
+   destroy(): void {
+-    // Flush before the destroyed flag goes up: `saveLocalSnapshot` bails on it,
+-    // so edits still sitting inside the save debounce — everything typed in the
+-    // last 800 ms, which offline is the only copy of — would be lost.
++    // Flush before the destroyed flag goes up: edits still sitting inside the
++    // save debounce — everything typed in the last 800 ms, which offline is
++    // the only copy of — would be lost.
+     this.flushLocalSave();
+ 
+     this.destroyed = true;
+@@ -686,10 +726,12 @@ export class LoroEngine implements CollabSession {
+     window.removeEventListener('pagehide', this.handlePageHide);
      if (this.reconnectTimer !== null) clearTimeout(this.reconnectTimer);
+     if (this.snapshotReplyTimer !== null) clearTimeout(this.snapshotReplyTimer);
 +    if (this.presenceHeartbeat !== null) clearInterval(this.presenceHeartbeat);
      for (const unsubscribe of this.unsubscribers) unsubscribe();
+     this.tabs.destroy();
      this.socket?.close();
      this.socket = null;
 +    this.undoManager.destroy();
      this.ephemeral.destroy();
      this.textListeners.clear();
      this.statusListeners.clear();
+@@ -697,50 +739,20 @@ export class LoroEngine implements CollabSession {
+     this.commentListeners.clear();
+     this.hydratedListeners.clear();
+   }
++}
+ 
+-  private markHydrated(): void {
+-    if (this.isHydrated) return;
+-    this.isHydrated = true;
+-    this.emitComments();
+-    for (const listener of this.hydratedListeners) listener();
+-  }
+-
+-  private emitComments(): void {
+-    this.cachedComments = this.readComments();
+-    for (const listener of this.commentListeners) listener(this.cachedComments);
+-  }
+-
+-  private commentById(id: string): CommentRecord | null {
+-    const json = this.doc.getMap(COMMENTS_MAP).toJSON() as Record<string, unknown>;
+-    return parseComment(json[id]);
+-  }
++const anchorEncoder = new TextEncoder();
++const anchorDecoder = new TextDecoder();
+ 
+-  private readComments(): CommentRecord[] {
+-    const map = this.doc.getMap(COMMENTS_MAP);
+-    const raw = readCommentMap(map.entries());
+-    const text = this.getText();
+-    return raw.map((comment) => {
+-      const fromCursors = this.rangeFromCursors(comment);
+-      const resolved = fromCursors ?? resolveCommentRange(comment, text);
+-      return resolved ? { ...comment, from: resolved.from, to: resolved.to } : comment;
+-    });
+-  }
++/** Anchors travel inside comment records as opaque base64url strings. */
++function encodeAnchor(anchor: EsbtAnchor): string {
++  return encodeBytes(anchorEncoder.encode(JSON.stringify(anchor)));
++}
+ 
+-  private rangeFromCursors(comment: CommentRecord): { from: number; to: number } | null {
+-    if (!comment.startCursor || !comment.endCursor) return null;
+-    try {
+-      const startBytes = decodeBytes(comment.startCursor);
+-      const endBytes = decodeBytes(comment.endCursor);
+-      if (!startBytes || !endBytes) return null;
+-      const start = this.doc.getCursorPos(Cursor.decode(startBytes));
+-      const end = this.doc.getCursorPos(Cursor.decode(endBytes));
+-      if (!start || !end) return null;
+-      return {
+-        from: Math.min(start.offset, end.offset),
+-        to: Math.max(start.offset, end.offset),
+-      };
+-    } catch {
+-      return null;
+-    }
+-  }
++function decodeAnchor(value: string): EsbtAnchor | null {
++  const bytes = decodeBytes(value);
++  if (!bytes) return null;
++  const parsed = JSON.parse(anchorDecoder.decode(bytes)) as Partial<EsbtAnchor>;
++  if (typeof parsed.weight !== 'string' || typeof parsed.offset !== 'number') return null;
++  return { weight: parsed.weight, offset: parsed.offset };
+ }
 diff --git a/client/src/collab/index.ts b/client/src/collab/index.ts
 index b002865..d6a8eaa 100644
 --- a/client/src/collab/index.ts
@@ -674,11 +903,12 @@ index 0000000..f55ff1d
 +  return [presenceField, plugin];
 +}
 diff --git a/client/src/collab/types.ts b/client/src/collab/types.ts
-index f21dba2..40aa700 100644
+index e27540b..38b531a 100644
 --- a/client/src/collab/types.ts
 +++ b/client/src/collab/types.ts
-@@ -1,6 +1,11 @@
+@@ -1,7 +1,12 @@
  import type { Extension } from '@codemirror/state';
+ import type { CommentRecord } from '../browser/comments';
  
 -export type EngineName = 'loro' | 'yjs';
 +/**
@@ -690,43 +920,47 @@ index f21dba2..40aa700 100644
  
  export type ConnectionStatus = 'connecting' | 'connected' | 'offline';
  
-@@ -29,8 +34,9 @@ export interface EngineStats {
- /**
-  * A live editing session for one document.
-  *
-- * Both CRDT engines expose exactly this surface, so the UI never branches on
-- * which one is in use. Everything above this interface is engine-agnostic.
-+ * The UI talks only to this surface, never to the CRDT directly — the same
-+ * boundary that once let Loro and Yjs coexist, kept so everything above it
-+ * stays engine-agnostic.
-  */
- export interface CollabSession {
-   readonly engine: EngineName;
-@@ -62,7 +68,6 @@ export interface CollabSession {
+@@ -73,9 +78,5 @@ export interface CollabSession {
  
  export interface SessionOptions {
    docId: string;
 -  engine: EngineName;
    user: LocalUser;
  }
- 
+-
+-/** Shared container/type name for the markdown source. Must match the server. */
+-export const TEXT_KEY = 'markdown';
 diff --git a/client/src/collab/yjs-engine.ts b/client/src/collab/yjs-engine.ts
 deleted file mode 100644
-index a41f312..0000000
+index ae09b5c..0000000
 --- a/client/src/collab/yjs-engine.ts
 +++ /dev/null
-@@ -1,188 +0,0 @@
+@@ -1,382 +0,0 @@
 -import type { Extension } from '@codemirror/state';
 -import { HocuspocusProvider } from '@hocuspocus/provider';
 -import { keymap } from '@codemirror/view';
 -import { IndexeddbPersistence } from 'y-indexeddb';
 -import { yCollab, yUndoManagerKeymap } from 'y-codemirror.next';
 -import * as Y from 'yjs';
+-import {
+-  COMMENTS_MAP,
+-  createCommentId,
+-  decodeBytes,
+-  encodeBytes,
+-  parseComment,
+-  readCommentMap,
+-  resolveCommentRange,
+-  serializeComment,
+-  TabChannel,
+-  tabChannelName,
+-  type CommentRecord,
+-} from '../browser';
 -import { colorVar } from './user';
+-import { TEXT_KEY, type CollabSession, type ConnectionStatus, type EngineStats, type Peer, type SessionOptions } from './types';
 -
 -/** How often the encoded document size is recomputed for the metrics panel. */
 -const SNAPSHOT_MEASURE_INTERVAL_MS = 2_000;
--import { TEXT_KEY, type CollabSession, type ConnectionStatus, type EngineStats, type Peer, type SessionOptions } from './types';
+-const TAB_ORIGIN = 'marks-tab';
 -
 -/**
 - * Yjs engine: YATA, served by Hocuspocus.
@@ -754,10 +988,26 @@ index a41f312..0000000
 -  private readonly textListeners = new Set<(text: string) => void>();
 -  private readonly statusListeners = new Set<(status: ConnectionStatus) => void>();
 -  private readonly peerListeners = new Set<(peers: Peer[]) => void>();
+-  private readonly commentListeners = new Set<(comments: CommentRecord[]) => void>();
+-  private readonly hydratedListeners = new Set<() => void>();
+-  private readonly commentMap: Y.Map<string>;
+-  private cachedComments: CommentRecord[] = [];
+-  private isHydrated = false;
+-  private snapshotReplyTimer: number | null = null;
+-  private readonly tabs: TabChannel;
+-  private readonly user: SessionOptions['user'];
 -
 -  constructor({ docId, user }: SessionOptions) {
 -    this.docId = docId;
+-    this.user = user;
 -    this.text = this.doc.getText(TEXT_KEY);
+-    this.commentMap = this.doc.getMap(COMMENTS_MAP);
+-    this.tabs = new TabChannel(tabChannelName('yjs', docId), {
+-      onHello: () => this.scheduleTabSnapshot(),
+-      onRequestSnapshot: () => this.scheduleTabSnapshot(),
+-      onUpdate: (bytes) => this.importFromTab(bytes),
+-      onSnapshot: (bytes) => this.importFromTab(bytes),
+-    });
 -
 -    const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
 -    this.provider = new HocuspocusProvider({
@@ -771,7 +1021,11 @@ index a41f312..0000000
 -    });
 -
 -    this.persistence = new IndexeddbPersistence(`marks:yjs:${docId}`, this.doc);
--    this.persistence.on('synced', () => this.emitText());
+-    this.persistence.on('synced', () => {
+-      this.emitText();
+-      this.emitComments();
+-      this.markHydrated();
+-    });
 -
 -    this.provider.awareness?.setLocalStateField('user', {
 -      name: user.name,
@@ -790,18 +1044,36 @@ index a41f312..0000000
 -    ];
 -
 -    this.text.observe(() => this.emitText());
+-    this.commentMap.observe(() => this.emitComments());
 -
 -    // Classify by transaction origin, which is the only way to tell the three
 -    // sources apart: the provider applies remote updates with itself as the
 -    // origin, y-indexeddb replays the local cache with itself as the origin,
--    // and a local edit arrives with neither.
+-    // a sibling tab applies with TAB_ORIGIN, and a local edit arrives with
+-    // none of those.
 -    this.doc.on('update', (update: Uint8Array, origin: unknown) => {
 -      if (origin === this.provider) this.counters.received += update.byteLength;
--      else if (origin !== this.persistence) this.counters.sent += update.byteLength;
+-      else if (origin === this.persistence) {
+-        // replay
+-      } else if (origin === TAB_ORIGIN) {
+-        this.counters.sent += update.byteLength;
+-      } else {
+-        this.counters.sent += update.byteLength;
+-        this.tabs.sendUpdate(update);
+-      }
 -      this.measureSnapshot();
 -    });
 -    this.provider.awareness?.on('change', () => this.refreshPeers());
 -    this.refreshPeers();
+-
+-    window.addEventListener('online', this.handleOnline);
+-    window.addEventListener('offline', this.handleOffline);
+-    document.addEventListener('visibilitychange', this.handleVisibility);
+-    window.addEventListener('pagehide', this.handlePageHide);
+-
+-    // IndexedDB may be empty on a first open; do not leave the skeleton up.
+-    window.setTimeout(() => this.markHydrated(), 50);
+-    this.tabs.hello();
 -  }
 -
 -  getText(): string {
@@ -861,6 +1133,62 @@ index a41f312..0000000
 -    return () => this.peerListeners.delete(listener);
 -  }
 -
+-  comments(): CommentRecord[] {
+-    return this.cachedComments;
+-  }
+-
+-  addComment(input: { from: number; to: number; quote: string; body: string }): string {
+-    const id = createCommentId();
+-    let startCursor: string | undefined;
+-    let endCursor: string | undefined;
+-    try {
+-      startCursor = encodeBytes(Y.encodeRelativePosition(Y.createRelativePositionFromTypeIndex(this.text, input.from)));
+-      endCursor = encodeBytes(Y.encodeRelativePosition(Y.createRelativePositionFromTypeIndex(this.text, input.to)));
+-    } catch {
+-      // quote+offset still work
+-    }
+-    const record: CommentRecord = {
+-      id,
+-      body: input.body,
+-      author: this.user.name,
+-      colorIndex: this.user.colorIndex,
+-      createdAt: Date.now(),
+-      resolved: false,
+-      from: input.from,
+-      to: input.to,
+-      quote: input.quote,
+-      startCursor,
+-      endCursor,
+-    };
+-    this.commentMap.set(id, serializeComment(record));
+-    return id;
+-  }
+-
+-  resolveComment(id: string): void {
+-    const existing = parseComment(this.commentMap.get(id));
+-    if (!existing || existing.resolved) return;
+-    this.commentMap.set(id, serializeComment({ ...existing, resolved: true }));
+-  }
+-
+-  deleteComment(id: string): void {
+-    this.commentMap.delete(id);
+-  }
+-
+-  onCommentsChange(listener: (comments: CommentRecord[]) => void): () => void {
+-    this.commentListeners.add(listener);
+-    return () => this.commentListeners.delete(listener);
+-  }
+-
+-  hydrated(): boolean {
+-    return this.isHydrated;
+-  }
+-
+-  onHydrated(listener: () => void): () => void {
+-    this.hydratedListeners.add(listener);
+-    if (this.isHydrated) queueMicrotask(listener);
+-    return () => this.hydratedListeners.delete(listener);
+-  }
+-
 -  private emitText(): void {
 -    if (this.textListeners.size === 0) return;
 -    const text = this.getText();
@@ -895,6 +1223,12 @@ index a41f312..0000000
 -  }
 -
 -  destroy(): void {
+-    window.removeEventListener('online', this.handleOnline);
+-    window.removeEventListener('offline', this.handleOffline);
+-    document.removeEventListener('visibilitychange', this.handleVisibility);
+-    window.removeEventListener('pagehide', this.handlePageHide);
+-    if (this.snapshotReplyTimer !== null) window.clearTimeout(this.snapshotReplyTimer);
+-    this.tabs.destroy();
 -    this.undoManager.destroy();
 -    this.provider.destroy();
 -    void this.persistence.destroy();
@@ -902,6 +1236,86 @@ index a41f312..0000000
 -    this.textListeners.clear();
 -    this.statusListeners.clear();
 -    this.peerListeners.clear();
+-    this.commentListeners.clear();
+-    this.hydratedListeners.clear();
+-  }
+-
+-  private handleOnline = (): void => {
+-    if (this.currentStatus === 'offline') this.setStatus('connecting');
+-  };
+-
+-  private handleOffline = (): void => {
+-    this.setStatus('offline');
+-  };
+-
+-  private handleVisibility = (): void => {
+-    if (document.visibilityState === 'visible') this.tabs.requestSnapshot();
+-  };
+-
+-  private handlePageHide = (): void => {
+-    // y-indexeddb flushes on its own; request a last persist by encoding.
+-    this.measureSnapshot();
+-  };
+-
+-  private importFromTab(bytes: Uint8Array): void {
+-    if (bytes.byteLength === 0) return;
+-    try {
+-      Y.applyUpdate(this.doc, bytes, TAB_ORIGIN);
+-    } catch (error) {
+-      console.error('[marks] rejected tab update', error);
+-    }
+-  }
+-
+-  private scheduleTabSnapshot(): void {
+-    if (this.snapshotReplyTimer !== null) return;
+-    this.snapshotReplyTimer = window.setTimeout(() => {
+-      this.snapshotReplyTimer = null;
+-      try {
+-        this.tabs.sendSnapshot(Y.encodeStateAsUpdate(this.doc));
+-      } catch {
+-        // empty
+-      }
+-    }, 32);
+-  }
+-
+-  private markHydrated(): void {
+-    if (this.isHydrated) return;
+-    this.isHydrated = true;
+-    this.emitComments();
+-    for (const listener of this.hydratedListeners) listener();
+-  }
+-
+-  private emitComments(): void {
+-    this.cachedComments = this.readComments();
+-    for (const listener of this.commentListeners) listener(this.cachedComments);
+-  }
+-
+-  private readComments(): CommentRecord[] {
+-    const entries: Array<[string, unknown]> = [];
+-    this.commentMap.forEach((value, key) => {
+-      entries.push([key, value]);
+-    });
+-    const text = this.getText();
+-    return readCommentMap(entries).map((comment) => {
+-      const fromCursors = this.rangeFromCursors(comment);
+-      const resolved = fromCursors ?? resolveCommentRange(comment, text);
+-      return resolved ? { ...comment, from: resolved.from, to: resolved.to } : comment;
+-    });
+-  }
+-
+-  private rangeFromCursors(comment: CommentRecord): { from: number; to: number } | null {
+-    if (!comment.startCursor || !comment.endCursor) return null;
+-    try {
+-      const startBytes = decodeBytes(comment.startCursor);
+-      const endBytes = decodeBytes(comment.endCursor);
+-      if (!startBytes || !endBytes) return null;
+-      const start = Y.createAbsolutePositionFromRelativePosition(Y.decodeRelativePosition(startBytes), this.doc);
+-      const end = Y.createAbsolutePositionFromRelativePosition(Y.decodeRelativePosition(endBytes), this.doc);
+-      if (!start || !end) return null;
+-      return { from: Math.min(start.index, end.index), to: Math.max(start.index, end.index) };
+-    } catch {
+-      return null;
+-    }
 -  }
 -}
 diff --git a/client/src/components/EmptyState.tsx b/client/src/components/EmptyState.tsx
@@ -962,7 +1376,7 @@ index 13dd266..c262a55 100644
        </div>
      </div>
 diff --git a/client/src/components/Sidebar.tsx b/client/src/components/Sidebar.tsx
-index b99c01f..7eb4a7b 100644
+index 119b5e1..ee12bd5 100644
 --- a/client/src/components/Sidebar.tsx
 +++ b/client/src/components/Sidebar.tsx
 @@ -1,6 +1,4 @@
@@ -972,16 +1386,16 @@ index b99c01f..7eb4a7b 100644
  import type { DocumentMeta } from '../lib/api';
  import { formatCount, formatRelativeTime } from '../lib/format';
  import { Icon, icons } from './Icon';
-@@ -10,7 +8,7 @@ interface SidebarProps {
-   activeId: string | null;
+@@ -11,7 +9,7 @@ interface SidebarProps {
    loading: boolean;
+   stale?: boolean;
    onOpen: (id: string) => void;
 -  onCreate: (engine: EngineName) => void;
 +  onCreate: () => void;
    onDelete: (id: string) => void;
    onOpenBenchmark: () => void;
  }
-@@ -25,7 +23,6 @@ export function Sidebar({
+@@ -27,7 +25,6 @@ export function Sidebar({
    onOpenBenchmark,
  }: SidebarProps) {
    const [query, setQuery] = useState('');
@@ -989,7 +1403,7 @@ index b99c01f..7eb4a7b 100644
  
    const filtered = query.trim()
      ? documents.filter((doc) => doc.title.toLowerCase().includes(query.trim().toLowerCase()))
-@@ -40,39 +37,10 @@ export function Sidebar({
+@@ -42,39 +39,10 @@ export function Sidebar({
          </div>
  
          <div className="new-doc">
@@ -1030,7 +1444,7 @@ index b99c01f..7eb4a7b 100644
          </div>
        </div>
  
-@@ -128,7 +96,7 @@ export function Sidebar({
+@@ -131,7 +99,7 @@ export function Sidebar({
  
        <button type="button" className="sidebar-foot" onClick={onOpenBenchmark}>
          <Icon path={icons.gauge} />
@@ -1040,7 +1454,7 @@ index b99c01f..7eb4a7b 100644
      </aside>
    );
 diff --git a/client/src/components/TopBar.tsx b/client/src/components/TopBar.tsx
-index 9675a3c..063f81b 100644
+index 712dcb4..0a82b50 100644
 --- a/client/src/components/TopBar.tsx
 +++ b/client/src/components/TopBar.tsx
 @@ -1,5 +1,5 @@
@@ -1060,11 +1474,12 @@ index 9675a3c..063f81b 100644
    peers: Peer[];
    mode: ViewMode;
 diff --git a/client/src/hooks/useDocumentMeta.ts b/client/src/hooks/useDocumentMeta.ts
-index 23697d0..b1bfb4d 100644
+index 231865e..9cc47e6 100644
 --- a/client/src/hooks/useDocumentMeta.ts
 +++ b/client/src/hooks/useDocumentMeta.ts
-@@ -1,19 +1,22 @@
+@@ -1,20 +1,23 @@
  import { useEffect, useState } from 'react';
+ import { readDocumentMeta, writeDocumentMeta } from '../browser/catalog-cache';
 -import type { EngineName } from '../collab/types';
  import { getDocument, type DocumentMeta } from '../lib/api';
  
@@ -1092,7 +1507,20 @@ index 23697d0..b1bfb4d 100644
   */
  export function useDocumentMeta(docId: string | null): DocumentMetaState {
    const [meta, setMeta] = useState<DocumentMeta | null>(null);
-@@ -45,5 +48,10 @@ export function useDocumentMeta(docId: string | null): DocumentMetaState {
+@@ -43,10 +46,8 @@ export function useDocumentMeta(docId: string | null): DocumentMetaState {
+         void writeDocumentMeta(document);
+       })
+       .catch(() => {
+-        // Keep a cached engine so an offline Yjs document is not opened as Loro.
+-        if (active) {
+-          /* meta already set from cache, or stays null for a true unknown id */
+-        }
++        // Keep a cached engine so an offline legacy document is not opened
++        // as ESBT; meta stays null only for a truly unknown id.
+       })
+       .finally(() => {
+         if (active) setResolved(true);
+@@ -57,5 +58,10 @@ export function useDocumentMeta(docId: string | null): DocumentMetaState {
      };
    }, [docId]);
  
@@ -1105,25 +1533,26 @@ index 23697d0..b1bfb4d 100644
 +  };
  }
 diff --git a/client/src/hooks/useDocuments.ts b/client/src/hooks/useDocuments.ts
-index b5075d3..87041f9 100644
+index cca2f15..c5ec9c6 100644
 --- a/client/src/hooks/useDocuments.ts
 +++ b/client/src/hooks/useDocuments.ts
-@@ -1,5 +1,4 @@
+@@ -1,6 +1,5 @@
  import { useCallback, useEffect, useRef, useState } from 'react';
+ import { forgetDocumentMeta, readCatalog, writeCatalog } from '../browser/catalog-cache';
 -import type { EngineName } from '../collab/types';
  import * as api from '../lib/api';
  
  const POLL_INTERVAL_MS = 8_000;
-@@ -9,7 +8,7 @@ export interface DocumentsState {
-   loading: boolean;
+@@ -11,7 +10,7 @@ export interface DocumentsState {
    error: string | null;
+   stale: boolean;
    refresh: () => Promise<void>;
 -  create: (engine: EngineName) => Promise<api.DocumentMeta>;
 +  create: () => Promise<api.DocumentMeta>;
    remove: (id: string) => Promise<void>;
  }
  
-@@ -57,14 +56,11 @@ export function useDocuments(): DocumentsState {
+@@ -68,14 +67,11 @@ export function useDocuments(): DocumentsState {
      };
    }, [refresh]);
  
@@ -1144,18 +1573,19 @@ index b5075d3..87041f9 100644
    const remove = useCallback(
      async (id: string) => {
 diff --git a/client/src/hooks/useSession.ts b/client/src/hooks/useSession.ts
-index af9d94e..71c45c2 100644
+index c6a5f5f..a523747 100644
 --- a/client/src/hooks/useSession.ts
 +++ b/client/src/hooks/useSession.ts
-@@ -1,6 +1,6 @@
+@@ -1,7 +1,7 @@
  import { useEffect, useMemo, useState } from 'react';
+ import type { CommentRecord } from '../browser/comments';
  import { createSession } from '../collab';
 -import type { CollabSession, ConnectionStatus, EngineName, LocalUser, Peer } from '../collab/types';
 +import type { CollabSession, ConnectionStatus, LocalUser, Peer } from '../collab/types';
  
  export interface SessionState {
    session: CollabSession | null;
-@@ -15,11 +15,7 @@ export interface SessionState {
+@@ -18,11 +18,7 @@ export interface SessionState {
   * flows straight to the editor and the preview renderer, neither of which is
   * a React-rendered tree.
   */
@@ -1168,7 +1598,7 @@ index af9d94e..71c45c2 100644
    const [session, setSession] = useState<CollabSession | null>(null);
    const [status, setStatus] = useState<ConnectionStatus>('connecting');
    const [peers, setPeers] = useState<Peer[]>([]);
-@@ -33,7 +29,7 @@ export function useSession(
+@@ -40,7 +36,7 @@ export function useSession(
        return;
      }
  
@@ -1177,14 +1607,14 @@ index af9d94e..71c45c2 100644
      setSession(next);
      setStatus(next.status());
      setPeers(next.peers());
-@@ -47,7 +43,7 @@ export function useSession(
+@@ -60,7 +56,7 @@ export function useSession(
        next.destroy();
        setSession(null);
      };
 -  }, [docId, engine, identity]);
 +  }, [docId, identity]);
  
-   return { session, status, peers };
+   return { session, status, peers, comments, hydrated };
  }
 diff --git a/client/src/lib/api.ts b/client/src/lib/api.ts
 index 5fe6781..8afb1c6 100644
@@ -1293,10 +1723,10 @@ index eefda22..aa61d20 100644
          </section>
        </div>
 diff --git a/client/src/styles/base.css b/client/src/styles/base.css
-index f7416f5..82a58ba 100644
+index c973d0a..cad6d0c 100644
 --- a/client/src/styles/base.css
 +++ b/client/src/styles/base.css
-@@ -193,14 +193,16 @@ a {
+@@ -194,14 +194,16 @@ a {
    text-transform: uppercase;
  }
  
@@ -1583,46 +2013,11 @@ index c009858..5d58674 100644
    worker: { format: 'es' },
    build: {
      target: 'es2022',
-diff --git a/esbt/src/index.ts b/esbt/src/index.ts
-index 02aa1b7..632462e 100644
---- a/esbt/src/index.ts
-+++ b/esbt/src/index.ts
-@@ -24,7 +24,10 @@ export type {
-   VersionVectorStatic,
- } from './api.js';
- 
--export type { EphemeralStoreStatic } from './ephemeral.js';
-+export type {
-+  EphemeralStore as EphemeralStoreType,
-+  EphemeralStoreStatic,
-+} from './ephemeral.js';
- 
- export { EsbtDoc } from './doc.js';
- export { VersionVector } from './vector.js';
 diff --git a/package-lock.json b/package-lock.json
-index 8d806cb..5658ddf 100644
+index 3704421..f52cc50 100644
 --- a/package-lock.json
 +++ b/package-lock.json
-@@ -9,7 +9,8 @@
-       "version": "0.1.0",
-       "workspaces": [
-         "client",
--        "server"
-+        "server",
-+        "esbt"
-       ],
-       "devDependencies": {
-         "concurrently": "^9.2.1",
-@@ -17,7 +18,7 @@
-         "typescript": "^5.9.3"
-       },
-       "engines": {
--        "node": ">=20"
-+        "node": ">=22.12"
-       }
-     },
-     "client": {
-@@ -32,15 +33,13 @@
+@@ -35,15 +35,13 @@
          "@codemirror/search": "^6.5.11",
          "@codemirror/state": "^6.7.1",
          "@codemirror/view": "^6.43.9",
@@ -1639,7 +2034,7 @@ index 8d806cb..5658ddf 100644
          "markdown-it": "^15.0.0",
          "markdown-it-abbr": "^2.0.0",
          "markdown-it-anchor": "^9.2.1",
-@@ -55,10 +54,7 @@
+@@ -58,10 +56,7 @@
          "markdown-it-sup": "^2.0.0",
          "mermaid": "^11.17.0",
          "react": "^19.2.0",
@@ -1651,22 +2046,20 @@ index 8d806cb..5658ddf 100644
        },
        "devDependencies": {
          "@types/react": "^19.2.0",
-@@ -68,6 +64,14 @@
-         "vite": "^8.2.2"
-       }
+@@ -73,7 +68,11 @@
      },
-+    "esbt": {
-+      "name": "@marks/esbt",
+     "esbt": {
+       "name": "@marks/esbt",
+-      "version": "0.1.0"
 +      "version": "0.1.0",
 +      "devDependencies": {
 +        "@types/node": "^22.15.0",
 +        "typescript": "^5.9.3"
 +      }
-+    },
+     },
      "node_modules/@antfu/install-pkg": {
        "version": "1.1.0",
-       "resolved": "https://registry.npmjs.org/@antfu/install-pkg/-/install-pkg-1.1.0.tgz",
-@@ -936,62 +940,6 @@
+@@ -943,62 +942,6 @@
          "node": ">=18"
        }
      },
@@ -1729,7 +2122,7 @@ index 8d806cb..5658ddf 100644
      "node_modules/@iconify/types": {
        "version": "2.0.0",
        "resolved": "https://registry.npmjs.org/@iconify/types/-/types-2.0.0.tgz",
-@@ -1186,12 +1134,6 @@
+@@ -1193,12 +1136,6 @@
          "@lezer/lr": "^1.4.0"
        }
      },
@@ -1742,18 +2135,7 @@ index 8d806cb..5658ddf 100644
      "node_modules/@marijn/find-cluster-break": {
        "version": "1.0.4",
        "resolved": "https://registry.npmjs.org/@marijn/find-cluster-break/-/find-cluster-break-1.0.4.tgz",
-@@ -1202,6 +1144,10 @@
-       "resolved": "client",
-       "link": true
-     },
-+    "node_modules/@marks/esbt": {
-+      "resolved": "esbt",
-+      "link": true
-+    },
-     "node_modules/@marks/server": {
-       "resolved": "server",
-       "link": true
-@@ -2076,19 +2022,11 @@
+@@ -2294,15 +2231,6 @@
        ],
        "license": "Python-2.0"
      },
@@ -1769,12 +2151,7 @@ index 8d806cb..5658ddf 100644
      "node_modules/better-sqlite3": {
        "version": "13.0.3",
        "resolved": "https://registry.npmjs.org/better-sqlite3/-/better-sqlite3-13.0.3.tgz",
-       "integrity": "sha512-RbOBxmLBG8uvFUc15X9+9SFemKcQ0WBuISBVkpuiaUB2qblC8UWlHEjdWVoZ8AdhSwmoEgsiXKfopX0CQxaACQ==",
-+      "hasInstallScript": true,
-       "license": "MIT",
-       "dependencies": {
-         "node-addon-api": "^8.0.0"
-@@ -2379,20 +2317,6 @@
+@@ -2614,20 +2542,6 @@
        "integrity": "sha512-aK6BbWfhf4U/wCcLHKPJl/xa6VkVstRaPywWtMKGwuOLc/wZTyQYuoxgvZnNsBvv7Kg3YTBQYYBCggcviQczuA==",
        "license": "MIT"
      },
@@ -1795,7 +2172,7 @@ index 8d806cb..5658ddf 100644
      "node_modules/csstype": {
        "version": "3.2.3",
        "resolved": "https://registry.npmjs.org/csstype/-/csstype-3.2.3.tgz",
-@@ -3508,16 +3432,6 @@
+@@ -3763,16 +3677,6 @@
        "integrity": "sha512-hvpoI6korhJMnej285dSg6nu1+e6uxs7zG3BYAm5byqDsgJNWwxzM6z6iZiAgQR4TJ30JmBTOwqZUw3WlyH3AQ==",
        "license": "MIT"
      },
@@ -1812,7 +2189,7 @@ index 8d806cb..5658ddf 100644
      "node_modules/katex": {
        "version": "0.18.4",
        "resolved": "https://registry.npmjs.org/katex/-/katex-0.18.4.tgz",
-@@ -3539,42 +3453,12 @@
+@@ -3794,42 +3698,12 @@
        "resolved": "https://registry.npmjs.org/khroma/-/khroma-2.1.0.tgz",
        "integrity": "sha512-Ls993zuzfayK269Svk9hzpeGUKob/sIgZzyHYdjQoAdQetRKpOLj+k/QQQ/6Qi0Yz65mlROrfd+Ev+1+7dz9Kw=="
      },
@@ -1855,7 +2232,7 @@ index 8d806cb..5658ddf 100644
      "node_modules/lightningcss": {
        "version": "1.33.0",
        "resolved": "https://registry.npmjs.org/lightningcss/-/lightningcss-1.33.0.tgz",
-@@ -3861,23 +3745,6 @@
+@@ -4116,23 +3990,6 @@
        "integrity": "sha512-J8xewKD/Gk22OZbhpOVSwcs60zhd95ESDwezOFuA3/099925PdHJ7OFHNTGtajL3AlZkykD32HykiMo+BIBI8A==",
        "license": "MIT"
      },
@@ -1879,7 +2256,7 @@ index 8d806cb..5658ddf 100644
      "node_modules/markdown-it": {
        "version": "15.0.0",
        "resolved": "https://registry.npmjs.org/markdown-it/-/markdown-it-15.0.0.tgz",
-@@ -4888,6 +4755,7 @@
+@@ -5178,6 +5035,7 @@
        "version": "2.8.1",
        "resolved": "https://registry.npmjs.org/tslib/-/tslib-2.8.1.tgz",
        "integrity": "sha512-oJFu94HQb+KVduSUQL7wnpmqnfmLsOA/nAh6b6EH0wCEoK0/mPeXU6c3wKDV83MkOuHPRHtSXKKU99IBazS/2w==",
@@ -1887,7 +2264,7 @@ index 8d806cb..5658ddf 100644
        "license": "0BSD"
      },
      "node_modules/tsx": {
-@@ -5127,65 +4995,6 @@
+@@ -5431,65 +5289,6 @@
          }
        }
      },
@@ -1953,7 +2330,7 @@ index 8d806cb..5658ddf 100644
      "node_modules/y18n": {
        "version": "5.0.8",
        "resolved": "https://registry.npmjs.org/y18n/-/y18n-5.0.8.tgz",
-@@ -5225,36 +5034,16 @@
+@@ -5529,23 +5328,6 @@
          "node": ">=12"
        }
      },
@@ -1974,7 +2351,10 @@ index 8d806cb..5658ddf 100644
 -        "url": "https://github.com/sponsors/dmonad"
 -      }
 -    },
-     "server": {
+     "node_modules/zod": {
+       "version": "3.25.76",
+       "resolved": "https://registry.npmjs.org/zod/-/zod-3.25.76.tgz",
+@@ -5560,15 +5342,12 @@
        "name": "@marks/server",
        "version": "0.1.0",
        "dependencies": {
@@ -1993,7 +2373,7 @@ index 8d806cb..5658ddf 100644
        "devDependencies": {
          "@types/better-sqlite3": "^7.6.13",
 diff --git a/package.json b/package.json
-index ab61c71..a2dea6d 100644
+index e8a55d6..aa0c1ff 100644
 --- a/package.json
 +++ b/package.json
 @@ -13,13 +13,15 @@
@@ -2009,56 +2389,12 @@ index ab61c71..a2dea6d 100644
      "start": "npm run start --workspace=server",
 -    "typecheck": "npm run typecheck --workspace=client && npm run typecheck --workspace=server && npm run typecheck --workspace=@marks/esbt",
 -    "clean": "rm -rf client/dist server/dist node_modules/.vite",
-+    "test:esbt": "npm test --workspace=@marks/esbt",
 +    "typecheck": "npm run typecheck --workspace=@marks/esbt && npm run typecheck --workspace=client && npm run typecheck --workspace=server",
 +    "clean": "rm -rf client/dist server/dist esbt/dist node_modules/.vite",
-     "smoke": "node scripts/smoke.mjs",
-     "measure": "node scripts/measure.mjs"
-   },
-diff --git a/server/package.json b/server/package.json
-index 94199bc..c0d1ac3 100644
---- a/server/package.json
-+++ b/server/package.json
-@@ -11,15 +11,12 @@
-     "typecheck": "tsc --noEmit"
-   },
-   "dependencies": {
--    "@hocuspocus/extension-database": "^4.6.0",
--    "@hocuspocus/server": "^4.6.0",
-+    "@marks/esbt": "*",
-     "better-sqlite3": "^13.0.3",
-     "compression": "^1.8.1",
-     "express": "^5.2.1",
--    "loro-crdt": "^1.14.1",
-     "nanoid": "^6.0.1",
--    "ws": "^8.21.3",
--    "yjs": "^13.6.32"
-+    "ws": "^8.21.3"
-   },
-   "devDependencies": {
-     "@types/better-sqlite3": "^7.6.13",
-diff --git a/server/src/store.ts b/server/src/store.ts
-index 506073c..bc19b36 100644
---- a/server/src/store.ts
-+++ b/server/src/store.ts
-@@ -31,7 +31,7 @@ db.exec(`
-   CREATE TABLE IF NOT EXISTS documents (
-     id          TEXT PRIMARY KEY,
-     title       TEXT    NOT NULL DEFAULT 'Untitled',
--    engine      TEXT    NOT NULL DEFAULT 'loro',
-+    engine      TEXT    NOT NULL DEFAULT 'esbt',
-     state       BLOB,
-     chars       INTEGER NOT NULL DEFAULT 0,
-     created_at  INTEGER NOT NULL,
-@@ -91,7 +91,7 @@ export function createDocument(opts: {
-   const row = {
-     id: opts.id ?? nanoid(12),
-     title: opts.title ?? 'Untitled',
--    engine: opts.engine ?? 'loro',
-+    engine: opts.engine ?? 'esbt',
-     state: null,
-     chars: 0,
-     created_at: now,
++    "test:esbt": "npm test --workspace=@marks/esbt",
+     "test:browser": "node --experimental-strip-types --test client/src/browser/*.test.ts",
+     "test:harness": "node --test scripts/harness/*.test.mjs",
+     "harness:probe": "node scripts/harness/probe.mjs",
 -- 
 2.43.0
 

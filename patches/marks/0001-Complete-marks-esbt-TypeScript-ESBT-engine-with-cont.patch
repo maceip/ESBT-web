@@ -1,37 +1,37 @@
-From aa4c9064ff7ba733ed1e5ee46937c9aa02ab2aae Mon Sep 17 00:00:00 2001
+From 44af85819b3f3103865f337b24e610db59f28586 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
-Date: Fri, 21 Aug 2026 23:30:04 +0000
-Subject: [PATCH 1/5] Complete @marks/esbt: TypeScript ESBT engine with
+Date: Fri, 21 Aug 2026 23:54:39 +0000
+Subject: [PATCH 1/6] Complete @marks/esbt: TypeScript ESBT engine with
  contract tests
 
 Replaces the partial fragments (vector/undo/tree referencing modules that
 did not exist) with the full engine from maceip/ESBT-web ts/: weights and
 CREATE_WEIGHT with strict-separation hardening, order-statistic RB tree,
 Algorithm 3 with pending deletes and the delete log, snapshot / shallow /
-update codecs, EsbtDoc with origin-tagged transactions and weight anchors,
-per-peer UndoManager with an optional merge window, and the TTL
-EphemeralStore. The package now builds to dist/ so Vite and Node consume
-plain ESM, and ships the 36-test contract suite the integration document
-lists.
+update codecs, EsbtDoc with origin-tagged transactions, weight anchors
+and a keyed LWW map (the comments carrier), per-peer UndoManager with
+merge windows and origin exclusion, and the TTL EphemeralStore. The
+package builds to dist/ so Vite and Node consume plain ESM, and ships
+the 40-test contract suite.
 ---
- esbt/README.md            | 118 +++----
+ esbt/README.md            | 118 +++---
  esbt/package.json         |  24 +-
- esbt/src/api.ts           |  53 ++-
- esbt/src/codec.ts         | 133 ++++++++
+ esbt/src/api.ts           |  73 +++-
+ esbt/src/codec.ts         | 133 +++++++
  esbt/src/constructors.ts  |  32 +-
- esbt/src/contract.test.ts | 701 ++++++++++++++++++++++++++++++++++++++
- esbt/src/doc.ts           | 590 ++++++++++++++++++++++++++++++++
- esbt/src/encode.ts        | 198 +++++++++++
- esbt/src/ephemeral.ts     | 184 +++++++++-
- esbt/src/index.ts         |  29 +-
- esbt/src/ops.ts           | 179 ++++++++++
- esbt/src/tree.ts          | 383 ++++++++++++++++++---
- esbt/src/undo.ts          |  75 +++-
+ esbt/src/contract.test.ts | 803 ++++++++++++++++++++++++++++++++++++++
+ esbt/src/doc.ts           | 684 ++++++++++++++++++++++++++++++++
+ esbt/src/encode.ts        | 232 +++++++++++
+ esbt/src/ephemeral.ts     | 184 ++++++++-
+ esbt/src/index.ts         |  32 +-
+ esbt/src/ops.ts           | 213 ++++++++++
+ esbt/src/tree.ts          | 383 ++++++++++++++++--
+ esbt/src/undo.ts          |  77 +++-
  esbt/src/vector.ts        |  12 +-
- esbt/src/weight.ts        | 393 +++++++++++++++++++++
+ esbt/src/weight.ts        | 393 +++++++++++++++++++
  esbt/tsconfig.build.json  |  10 +
  esbt/tsconfig.json        |   9 +-
- 17 files changed, 2969 insertions(+), 154 deletions(-)
+ 17 files changed, 3258 insertions(+), 154 deletions(-)
  create mode 100644 esbt/src/codec.ts
  create mode 100644 esbt/src/contract.test.ts
  create mode 100644 esbt/src/doc.ts
@@ -228,7 +228,7 @@ index 8454a1c..194661b 100644
    }
  }
 diff --git a/esbt/src/api.ts b/esbt/src/api.ts
-index 73a20f7..fe543c4 100644
+index 73a20f7..5155230 100644
 --- a/esbt/src/api.ts
 +++ b/esbt/src/api.ts
 @@ -13,6 +13,18 @@
@@ -269,7 +269,7 @@ index 73a20f7..fe543c4 100644
  /**
   * Change notification after the local document has been updated.
   *
-@@ -197,20 +221,41 @@ export interface EsbtDoc {
+@@ -197,20 +221,61 @@ export interface EsbtDoc {
     * that already holds a causal prefix of this one.
     */
    subscribeLocalUpdates(listener: (update: Uint8Array) => void): () => void;
@@ -284,6 +284,20 @@ index 73a20f7..fe543c4 100644
 +   * item would occupy today, so ranges collapse instead of drifting.
 +   */
 +  anchorToIndex(anchor: EsbtAnchor): number;
++
++  /**
++   * Keyed last-writer-wins map riding the document — same oplog, snapshots,
++   * and version vectors as the text. Contract addition: marks stores comment
++   * records here (the way it used a Loro/Yjs map container), so they sync,
++   * work offline, and survive merges without polluting the markdown.
++   * Values are opaque strings; the highest (lamport, site) write per key
++   * wins on every replica. Deletes leave a mergeable tombstone.
++   */
++  mapSet(key: string, value: string): void;
++  mapDelete(key: string): void;
++  mapGet(key: string): string | undefined;
++  /** Live entries, sorted by key. */
++  mapEntries(): Array<[string, string]>;
  }
  
  export interface EsbtDocStatic {
@@ -298,6 +312,12 @@ index 73a20f7..fe543c4 100644
 +   * strict contract behaviour of one transact = one step. Marks passes 500.
 +   */
 +  mergeIntervalMs?: number;
++  /**
++   * Transacts whose origin starts with any of these prefixes never enter
++   * the undo stack (Loro's `excludeOriginPrefixes`). Marks excludes its
++   * comment writes so Mod-Z never deletes a comment.
++   */
++  excludeOriginPrefixes?: string[];
 +}
 +
  /**
@@ -314,7 +334,7 @@ index 73a20f7..fe543c4 100644
   */
  export interface UndoManager {
    canUndo(): boolean;
-@@ -221,7 +266,7 @@ export interface UndoManager {
+@@ -221,7 +286,7 @@ export interface UndoManager {
  }
  
  export interface UndoManagerStatic {
@@ -505,10 +525,10 @@ index 51a52ec..c9f2c23 100644
 +];
 diff --git a/esbt/src/contract.test.ts b/esbt/src/contract.test.ts
 new file mode 100644
-index 0000000..34a9596
+index 0000000..5fd66b5
 --- /dev/null
 +++ b/esbt/src/contract.test.ts
-@@ -0,0 +1,701 @@
+@@ -0,0 +1,803 @@
 +/**
 + * Contract tests: every invariant `docs/ESBT-INTEGRATION.md` says marks will
 + * assert, plus the paper's worked situations from the Rust reference suite,
@@ -1154,6 +1174,108 @@ index 0000000..34a9596
 +  store.destroy();
 +});
 +
++/* ------------------------------------------------------------ LWW map */
++
++test('map: set/get/delete/entries, syncs over updates, rides snapshots', () => {
++  const a = new EsbtDoc({ siteId: 'a' });
++  const b = new EsbtDoc({ siteId: 'b' });
++  const unwire = wire(a, b);
++
++  a.mapSet('c_1', '{"body":"first comment"}');
++  a.mapSet('c_2', '{"body":"second"}');
++  assert.equal(a.mapGet('c_1'), '{"body":"first comment"}');
++  assert.deepEqual(
++    a.mapEntries(),
++    [
++      ['c_1', '{"body":"first comment"}'],
++      ['c_2', '{"body":"second"}'],
++    ],
++  );
++  assert.deepEqual(b.mapEntries(), a.mapEntries());
++
++  a.mapDelete('c_1');
++  assert.equal(a.mapGet('c_1'), undefined);
++  assert.deepEqual(b.mapEntries(), [['c_2', '{"body":"second"}']]);
++  unwire();
++
++  // Snapshots (both flavours) carry the map: a cold open paints comments.
++  const fresh = new EsbtDoc();
++  fresh.import(a.export({ mode: 'snapshot' }));
++  assert.deepEqual(fresh.mapEntries(), a.mapEntries());
++  const shallow = new EsbtDoc();
++  shallow.import(a.export({ mode: 'shallow-snapshot' }));
++  assert.deepEqual(shallow.mapEntries(), a.mapEntries());
++
++  // The tombstone must merge: a replica that only saw the set drops the key.
++  const late = new EsbtDoc({ siteId: 'late' });
++  late.import(a.export({ mode: 'snapshot' }));
++  assert.equal(late.mapGet('c_1'), undefined);
++});
++
++test('map: concurrent writes to one key converge on the same winner', () => {
++  const a = new EsbtDoc({ siteId: 'aaa' });
++  const b = new EsbtDoc({ siteId: 'bbb' });
++  const fromA: Uint8Array[] = [];
++  const fromB: Uint8Array[] = [];
++  a.subscribeLocalUpdates((u) => fromA.push(u));
++  b.subscribeLocalUpdates((u) => fromB.push(u));
++
++  a.mapSet('k', 'from-a');
++  b.mapSet('k', 'from-b');
++  for (const u of fromB) a.import(u);
++  for (const u of fromA) b.import(u);
++
++  assert.equal(a.mapGet('k'), b.mapGet('k'));
++
++  // A later write beats both, in either delivery order.
++  const fromA2: Uint8Array[] = [];
++  a.subscribeLocalUpdates((u) => fromA2.push(u));
++  a.mapSet('k', 'settled');
++  for (const u of fromA2) b.import(u);
++  assert.equal(a.mapGet('k'), 'settled');
++  assert.equal(b.mapGet('k'), 'settled');
++});
++
++test('map: writes fire subscribe, ride local updates, and offline deltas include them', () => {
++  const a = new EsbtDoc({ siteId: 'a' });
++  const b = new EsbtDoc({ siteId: 'b' });
++  b.import(a.export({ mode: 'update' }));
++
++  const events: string[] = [];
++  b.subscribe((event) => events.push(event.origin ?? 'remote'));
++
++  a.transact(() => a.mapSet('c', 'v1'), 'comments');
++  b.import(a.export({ mode: 'update', from: b.oplogVersion() }));
++  assert.equal(events.length, 1);
++  assert.equal(b.mapGet('c'), 'v1');
++
++  // Idempotent: replaying everything from birth changes nothing, silently.
++  b.import(a.export({ mode: 'update' }));
++  assert.equal(events.length, 1);
++});
++
++test('map writes never enter the undo stack', () => {
++  const doc = new EsbtDoc();
++  const undo = new UndoManager(doc, { excludeOriginPrefixes: ['comments'] });
++
++  doc.transact(() => doc.insert(0, 'text'), 'editor');
++  doc.transact(() => doc.mapSet('c_1', 'a comment'), 'comments');
++
++  undo.undo();
++  assert.equal(doc.getText(), '');
++  assert.equal(doc.mapGet('c_1'), 'a comment'); // the comment survives Mod-Z
++
++  // Even in a mixed batch, undo skips map ops.
++  doc.transact(() => {
++    doc.insert(0, 'more');
++    doc.mapSet('c_2', 'inline');
++  }, 'editor');
++  undo.undo();
++  assert.equal(doc.getText(), '');
++  assert.equal(doc.mapGet('c_2'), 'inline');
++  undo.destroy();
++});
++
 +/* ----------------------------------------------------- degenerate gaps */
 +
 +test('inserting between concurrent same-gap twins never drops or misplaces beyond the pair', () => {
@@ -1212,10 +1334,10 @@ index 0000000..34a9596
 +});
 diff --git a/esbt/src/doc.ts b/esbt/src/doc.ts
 new file mode 100644
-index 0000000..b40ef98
+index 0000000..10ef0d9
 --- /dev/null
 +++ b/esbt/src/doc.ts
-@@ -0,0 +1,590 @@
+@@ -0,0 +1,684 @@
 +/**
 + * EsbtDoc — the sequence document (Algorithm 3 plus the editor surface the
 + * marks contract names): UTF-16 index edits, origin-tagged transactions,
@@ -1233,7 +1355,7 @@ index 0000000..b40ef98
 +
 +import type { EsbtAnchor, EsbtConfig, EsbtEvent, EsbtExportOptions } from './api.js';
 +import { decodePayload, encodeSnapshot, encodeUpdate, type SnapshotPayload } from './encode.js';
-+import { DeleteLog, PendingQueue, type Op } from './ops.js';
++import { DeleteLog, PendingQueue, type Op, type SeqOp } from './ops.js';
 +import { DocSeq, type Item } from './tree.js';
 +import { VersionVector } from './vector.js';
 +import {
@@ -1279,6 +1401,12 @@ index 0000000..b40ef98
 +  private readonly log = new Map<SiteId, Map<number, Op>>();
 +  /** site → last insertion counter c that site handed out. */
 +  private readonly counters = new Map<SiteId, number>();
++  /** Keyed LWW registers riding the document (comments and similar). */
++  private readonly mapState = new Map<
++    string,
++    { value: string | null; lamport: number; site: SiteId }
++  >();
++  private maxLamport = 0;
 +
 +  private counter = 0;
 +  private localSeq = 0;
@@ -1469,6 +1597,68 @@ index 0000000..b40ef98
 +    return op;
 +  }
 +
++  /* ------------------------------------------------------------ LWW map */
++
++  /**
++   * Set a key in the document's keyed last-writer-wins map. The map rides
++   * the same oplog, snapshots, and version vectors as the text — marks
++   * stores comment records here so they sync, work offline, and survive a
++   * merge, without ever being encoded as characters in the markdown.
++   */
++  mapSet(key: string, value: string): void {
++    this.transact(() => this.mapWrite(key, value));
++  }
++
++  /** Delete a key (a tombstone with the write's clock survives for merging). */
++  mapDelete(key: string): void {
++    this.transact(() => this.mapWrite(key, null));
++  }
++
++  mapGet(key: string): string | undefined {
++    const entry = this.mapState.get(key);
++    return entry && entry.value !== null ? entry.value : undefined;
++  }
++
++  /** Live entries, sorted by key. */
++  mapEntries(): Array<[string, string]> {
++    const out: Array<[string, string]> = [];
++    for (const [key, entry] of this.mapState) {
++      if (entry.value !== null) out.push([key, entry.value]);
++    }
++    out.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
++    return out;
++  }
++
++  private mapWrite(key: string, value: string | null): void {
++    this.maxLamport += 1;
++    const op: Op = {
++      kind: 'map',
++      site: this.siteId,
++      seq: this.stamp(),
++      key,
++      value,
++      lamport: this.maxLamport,
++    };
++    this.logAdd(op);
++    this.applyMap(key, value, op.lamport, op.site);
++    this.txOps.push(op);
++  }
++
++  /** Highest (lamport, site) wins; replays and stale writes are no-ops. */
++  private applyMap(key: string, value: string | null, lamport: number, site: SiteId): boolean {
++    if (lamport > this.maxLamport) this.maxLamport = lamport;
++    const existing = this.mapState.get(key);
++    if (
++      existing &&
++      (existing.lamport > lamport || (existing.lamport === lamport && existing.site >= site))
++    ) {
++      return false;
++    }
++    this.mapState.set(key, { value, lamport, site });
++    this.mutations += 1;
++    return true;
++  }
++
 +  private stamp(): number {
 +    this.localSeq += 1;
 +    this.vvNote(this.siteId, this.localSeq);
@@ -1477,7 +1667,7 @@ index 0000000..b40ef98
 +
 +  /* --------------------------------------------------------- application */
 +
-+  private applyIns(op: Op): boolean {
++  private applyIns(op: SeqOp): boolean {
 +    if (this.deleteLog.has(op.weight, op.counter)) return false;
 +    const index = this.seq.insert({ weight: op.weight, unit: op.unit ?? 0, counter: op.counter });
 +    if (index < 0) return false;
@@ -1525,6 +1715,7 @@ index 0000000..b40ef98
 +    if (op.site === this.siteId) {
 +      this.localSeq = Math.max(this.localSeq, op.seq);
 +      if (op.kind === 'ins') this.counter = Math.max(this.counter, op.counter);
++      if (op.kind === 'map') this.maxLamport = Math.max(this.maxLamport, op.lamport);
 +    }
 +
 +    const before = this.mutations;
@@ -1539,6 +1730,10 @@ index 0000000..b40ef98
 +
 +  /** One attempt at a buffered op. True = consumed (applied or discarded). */
 +  private step(op: Op): boolean {
++    if (op.kind === 'map') {
++      this.applyMap(op.key, op.value, op.lamport, op.site);
++      return true; // LWW: always ready, stale writes are discarded
++    }
 +    if (op.kind === 'ins') {
 +      this.applyIns(op);
 +      return true; // insertions are always ready; duplicates are discarded
@@ -1571,6 +1766,7 @@ index 0000000..b40ef98
 +            deleteLog: this.deleteLog.values(),
 +            version: new Map(this.vv),
 +            counters: new Map(this.counters),
++            mapState: this.mapStateEntries(),
 +            ops: this.allOps(),
 +          },
 +          false,
@@ -1582,6 +1778,7 @@ index 0000000..b40ef98
 +            deleteLog: [],
 +            version: new Map(this.vv),
 +            counters: new Map(this.counters),
++            mapState: this.mapStateEntries(),
 +            ops: [],
 +          },
 +          true,
@@ -1621,6 +1818,19 @@ index 0000000..b40ef98
 +      }
 +    }
 +    return ops;
++  }
++
++  private mapStateEntries(): Array<{
++    key: string;
++    value: string | null;
++    lamport: number;
++    site: SiteId;
++  }> {
++    const out = [];
++    for (const [key, entry] of this.mapState) {
++      out.push({ key, value: entry.value, lamport: entry.lamport, site: entry.site });
++    }
++    return out;
 +  }
 +
 +  import(bytes: Uint8Array): void {
@@ -1677,11 +1887,14 @@ index 0000000..b40ef98
 +      }
 +    }
 +
-+    // 3. Clocks.
++    // 3. Clocks and the LWW map.
 +    for (const [site, seq] of payload.version) this.vvNote(site, seq);
 +    for (const [site, c] of payload.counters) {
 +      const seen = this.counters.get(site) ?? 0;
 +      if (c > seen) this.counters.set(site, c);
++    }
++    for (const entry of payload.mapState) {
++      this.applyMap(entry.key, entry.value, entry.lamport, entry.site);
 +    }
 +
 +    // 4. Oplog union, replaying only ops whose effect is not yet visible —
@@ -1691,9 +1904,11 @@ index 0000000..b40ef98
 +      if (this.logHas(op.site, op.seq)) continue;
 +      this.logAdd(op);
 +      const applied =
-+        op.kind === 'ins'
-+          ? this.deleteLog.has(op.weight, op.counter) || this.seq.has(op.weight)
-+          : this.deleteLog.has(op.weight, op.counter);
++        op.kind === 'map'
++          ? true // the map section above is authoritative for logged writes
++          : op.kind === 'ins'
++            ? this.deleteLog.has(op.weight, op.counter) || this.seq.has(op.weight)
++            : this.deleteLog.has(op.weight, op.counter);
 +      if (!applied) this.pending.push(op);
 +    }
 +
@@ -1778,6 +1993,7 @@ index 0000000..b40ef98
 +    const inverse: Op[] = [];
 +    this.transact(() => {
 +      for (const op of batch) {
++        if (op.kind === 'map') continue; // map writes are not undoable
 +        if (op.kind === 'ins') {
 +          const live = this.seq.find(op.weight);
 +          if (!live || live.counter !== op.counter) continue;
@@ -1808,10 +2024,10 @@ index 0000000..b40ef98
 +}
 diff --git a/esbt/src/encode.ts b/esbt/src/encode.ts
 new file mode 100644
-index 0000000..4d032fe
+index 0000000..732496a
 --- /dev/null
 +++ b/esbt/src/encode.ts
-@@ -0,0 +1,198 @@
+@@ -0,0 +1,232 @@
 +/**
 + * Payload formats: snapshot / shallow-snapshot / update.
 + *
@@ -1838,6 +2054,14 @@ index 0000000..4d032fe
 +  counter: number;
 +}
 +
++export interface MapStateEntry {
++  key: string;
++  /** null = tombstone: the key was deleted at this (lamport, site). */
++  value: string | null;
++  lamport: number;
++  site: SiteId;
++}
++
 +export interface SnapshotPayload {
 +  kind: 'snapshot' | 'shallow-snapshot';
 +  /** Live items in document order. */
@@ -1848,6 +2072,8 @@ index 0000000..4d032fe
 +  version: Map<SiteId, number>;
 +  /** site → last insertion counter c handed out by that site. */
 +  counters: Map<SiteId, number>;
++  /** Keyed LWW register state (comments and similar document metadata). */
++  mapState: MapStateEntry[];
 +  /** Full oplog (empty in a shallow snapshot). */
 +  ops: Op[];
 +}
@@ -1919,6 +2145,17 @@ index 0000000..4d032fe
 +
 +  writeSiteMap(body, table, payload.version);
 +  writeSiteMap(body, table, payload.counters);
++
++  // The LWW map is visible state, so both snapshot flavours carry it —
++  // a cold open must paint comments, not only text.
++  body.uint(payload.mapState.length);
++  for (const entry of payload.mapState) {
++    body.str(entry.key);
++    body.u8(entry.value === null ? 0 : 1);
++    if (entry.value !== null) body.str(entry.value);
++    body.uint(entry.lamport);
++    body.uint(table.idOf(entry.site));
++  }
 +
 +  if (shallow) {
 +    body.uint(0); // oplog
@@ -1997,6 +2234,18 @@ index 0000000..4d032fe
 +  const version = readSiteMap(r, sites);
 +  const counters = readSiteMap(r, sites);
 +
++  const mapCount = r.uint();
++  const mapState: MapStateEntry[] = [];
++  for (let i = 0; i < mapCount; i++) {
++    const key = r.str();
++    const hasValue = r.u8() !== 0;
++    const value = hasValue ? r.str() : null;
++    const lamport = r.uint();
++    const siteIdx = r.uint();
++    if (siteIdx >= sites.length) throw new Error('esbt: bad site reference');
++    mapState.push({ key, value, lamport, site: sites[siteIdx] });
++  }
++
 +  const opCount = r.uint();
 +  const ops: Op[] = [];
 +  for (let i = 0; i < opCount; i++) ops.push(readOp(r, sites));
@@ -2007,6 +2256,7 @@ index 0000000..4d032fe
 +    deleteLog,
 +    version,
 +    counters,
++    mapState,
 +    ops,
 +  };
 +}
@@ -2215,7 +2465,7 @@ index 9fa54c6..2f9503c 100644
 +
 +export const EphemeralStore: EphemeralStoreStatic = EphemeralStoreImpl;
 diff --git a/esbt/src/index.ts b/esbt/src/index.ts
-index c0d56f4..02aa1b7 100644
+index c0d56f4..632462e 100644
 --- a/esbt/src/index.ts
 +++ b/esbt/src/index.ts
 @@ -1,13 +1,15 @@
@@ -2239,7 +2489,7 @@ index c0d56f4..02aa1b7 100644
    EsbtDocStatic,
    EsbtEvent,
    EsbtExportOptions,
-@@ -16,15 +18,24 @@ export type {
+@@ -16,15 +18,27 @@ export type {
    EsbtPresenceState,
    EsbtTextRange,
    UndoManager as UndoManagerType,
@@ -2250,7 +2500,10 @@ index c0d56f4..02aa1b7 100644
  } from './api.js';
  
 -export type { EphemeralStore, EphemeralStoreStatic } from './ephemeral.js';
-+export type { EphemeralStoreStatic } from './ephemeral.js';
++export type {
++  EphemeralStore as EphemeralStoreType,
++  EphemeralStoreStatic,
++} from './ephemeral.js';
  
 +export { EsbtDoc } from './doc.js';
  export { VersionVector } from './vector.js';
@@ -2270,10 +2523,10 @@ index c0d56f4..02aa1b7 100644
 +export type { Fraction, SiteId, Weight } from './weight.js';
 diff --git a/esbt/src/ops.ts b/esbt/src/ops.ts
 new file mode 100644
-index 0000000..4024b77
+index 0000000..a345205
 --- /dev/null
 +++ b/esbt/src/ops.ts
-@@ -0,0 +1,179 @@
+@@ -0,0 +1,213 @@
 +/**
 + * INS(ω, e, c) and DEL(ω, c) — paper §4.2 / §5.2 — plus the two structures
 + * Algorithm 3 needs around them: the pending queue for deletes that arrived
@@ -2294,8 +2547,12 @@ index 0000000..4024b77
 + * `unit` is the inserted UTF-16 code unit. On a delete it is populated only
 + * for locally generated ops (the undo manager needs the removed unit to
 + * reinsert it); it is never encoded on the wire for deletes.
++ *
++ * `map` ops carry the keyed last-writer-wins register writes that ride the
++ * document (marks stores comments there). They have no causal dependencies:
++ * the highest (lamport, site) write for a key wins on every replica.
 + */
-+export interface Op {
++export interface SeqOp {
 +  kind: 'ins' | 'del';
 +  site: SiteId;
 +  seq: number;
@@ -2303,6 +2560,18 @@ index 0000000..4024b77
 +  counter: number;
 +  unit?: number;
 +}
++
++export interface MapOp {
++  kind: 'map';
++  site: SiteId;
++  seq: number;
++  key: string;
++  /** null = delete the key. */
++  value: string | null;
++  lamport: number;
++}
++
++export type Op = SeqOp | MapOp;
 +
 +/** Deletes waiting for their matching insert (ω, c). */
 +export class PendingQueue {
@@ -2425,8 +2694,19 @@ index 0000000..4024b77
 +
 +const OP_INS = 1;
 +const OP_DEL = 2;
++const OP_MAP = 3;
 +
 +export function writeOp(w: Writer, table: SiteTable, op: Op): void {
++  if (op.kind === 'map') {
++    w.u8(OP_MAP);
++    w.uint(table.idOf(op.site));
++    w.uint(op.seq);
++    w.str(op.key);
++    w.u8(op.value === null ? 0 : 1);
++    if (op.value !== null) w.str(op.value);
++    w.uint(op.lamport);
++    return;
++  }
 +  w.u8(op.kind === 'ins' ? OP_INS : OP_DEL);
 +  w.uint(table.idOf(op.site));
 +  w.uint(op.seq);
@@ -2441,11 +2721,18 @@ index 0000000..4024b77
 +
 +export function readOp(r: Reader, sites: SiteId[]): Op {
 +  const tag = r.u8();
-+  if (tag !== OP_INS && tag !== OP_DEL) throw new Error('esbt: unknown op tag');
++  if (tag !== OP_INS && tag !== OP_DEL && tag !== OP_MAP) throw new Error('esbt: unknown op tag');
 +  const siteIdx = r.uint();
 +  if (siteIdx >= sites.length) throw new Error('esbt: bad site reference');
 +  const site = sites[siteIdx];
 +  const seq = r.uint();
++  if (tag === OP_MAP) {
++    const key = r.str();
++    const hasValue = r.u8() !== 0;
++    const value = hasValue ? r.str() : null;
++    const lamport = r.uint();
++    return { kind: 'map', site, seq, key, value, lamport };
++  }
 +  const w = readWeight(r, sites);
 +  const counter = r.uint();
 +  if (tag === OP_INS) {
@@ -2886,10 +3173,10 @@ index 4def58c..14a639c 100644
    return `${weightKey(w)}#${c}`;
  }
 diff --git a/esbt/src/undo.ts b/esbt/src/undo.ts
-index 73053f6..a8ce15d 100644
+index 73053f6..bf6efdb 100644
 --- a/esbt/src/undo.ts
 +++ b/esbt/src/undo.ts
-@@ -1,18 +1,50 @@
+@@ -1,18 +1,52 @@
 +/**
 + * Per-peer undo. Only operations this replica generated are undoable —
 + * imports never enter the stacks — and undoing emits *new* operations
@@ -2918,6 +3205,7 @@ index 73053f6..a8ce15d 100644
 +    }
 +    this.doc = impl;
 +    this.mergeIntervalMs = Math.max(0, options.mergeIntervalMs ?? 0);
++    const excluded = options.excludeOriginPrefixes ?? [];
  
 -  constructor(doc: EsbtDoc) {
 -    this.doc = doc;
@@ -2926,6 +3214,7 @@ index 73053f6..a8ce15d 100644
        if (origin === 'undo' || origin === 'redo') return;
 -      if (!ops.length) return;
 -      this.undoStack.push(ops);
++      if (origin && excluded.some((prefix) => origin.startsWith(prefix))) return;
 +      if (ops.length === 0) return;
 +
 +      const now = Date.now();
@@ -2947,7 +3236,7 @@ index 73053f6..a8ce15d 100644
        this.redoStack = [];
      });
    }
-@@ -26,23 +58,34 @@ export class UndoManager {
+@@ -26,23 +60,34 @@ export class UndoManager {
    }
  
    undo(): void {

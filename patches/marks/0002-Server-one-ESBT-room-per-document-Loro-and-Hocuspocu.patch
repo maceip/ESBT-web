@@ -1,7 +1,7 @@
-From e3f2bc4fec3ff2e1459b57188028144f80a7b276 Mon Sep 17 00:00:00 2001
+From bafce31f92c0486d4d6cc48887d1044b88fa3483 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
-Date: Fri, 21 Aug 2026 23:32:00 +0000
-Subject: [PATCH 2/5] Server: one ESBT room per document; Loro and
+Date: Fri, 21 Aug 2026 23:55:17 +0000
+Subject: [PATCH 2/6] Server: one ESBT room per document; Loro and
  Hocuspocus/Yjs removed
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -17,16 +17,40 @@ cannot corrupt stored state. Legacy rows stay listed but export empty.
 Seed and export go through EsbtDoc. loro-crdt, yjs and both Hocuspocus
 packages leave the dependency tree.
 ---
+ server/package.json                       |   7 +-
  server/src/api.ts                         |  41 +++------
  server/src/{loro-room.ts => esbt-room.ts} |  63 ++++++-------
  server/src/index.ts                       |  54 +++++------
+ server/src/protocol.ts                    |   4 +-
  server/src/seed.ts                        |  10 +-
- server/src/store.ts                       |   8 +-
+ server/src/store.ts                       |  12 ++-
  server/src/yjs-room.ts                    | 106 ----------------------
- 6 files changed, 78 insertions(+), 204 deletions(-)
+ 8 files changed, 84 insertions(+), 213 deletions(-)
  rename server/src/{loro-room.ts => esbt-room.ts} (81%)
  delete mode 100644 server/src/yjs-room.ts
 
+diff --git a/server/package.json b/server/package.json
+index 94199bc..c0d1ac3 100644
+--- a/server/package.json
++++ b/server/package.json
+@@ -11,15 +11,12 @@
+     "typecheck": "tsc --noEmit"
+   },
+   "dependencies": {
+-    "@hocuspocus/extension-database": "^4.6.0",
+-    "@hocuspocus/server": "^4.6.0",
++    "@marks/esbt": "*",
+     "better-sqlite3": "^13.0.3",
+     "compression": "^1.8.1",
+     "express": "^5.2.1",
+-    "loro-crdt": "^1.14.1",
+     "nanoid": "^6.0.1",
+-    "ws": "^8.21.3",
+-    "yjs": "^13.6.32"
++    "ws": "^8.21.3"
+   },
+   "devDependencies": {
+     "@types/better-sqlite3": "^7.6.13",
 diff --git a/server/src/api.ts b/server/src/api.ts
 index c2494e7..ecf8aaa 100644
 --- a/server/src/api.ts
@@ -317,7 +341,7 @@ index c09b120..6189f64 100644
    }
  
 diff --git a/server/src/index.ts b/server/src/index.ts
-index ab15362..3287340 100644
+index 4abb546..6321d30 100644
 --- a/server/src/index.ts
 +++ b/server/src/index.ts
 @@ -6,10 +6,9 @@ import path from 'node:path';
@@ -332,7 +356,7 @@ index ab15362..3287340 100644
  
  const app = express();
  app.use(compression());
-@@ -49,11 +48,11 @@ const server = http.createServer(app);
+@@ -50,11 +49,11 @@ const server = http.createServer(app);
  const wss = new WebSocketServer({ noServer: true });
  
  /**
@@ -348,7 +372,7 @@ index ab15362..3287340 100644
  
  server.on('upgrade', (request, socket, head) => {
    const url = new URL(request.url ?? '/', 'http://localhost');
-@@ -64,28 +63,23 @@ server.on('upgrade', (request, socket, head) => {
+@@ -65,28 +64,23 @@ server.on('upgrade', (request, socket, head) => {
      return;
    }
  
@@ -391,7 +415,7 @@ index ab15362..3287340 100644
    }
  
    // Clients that already hold state announce it, so we can answer with a delta.
-@@ -93,11 +87,7 @@ server.on('upgrade', (request, socket, head) => {
+@@ -94,11 +88,7 @@ server.on('upgrade', (request, socket, head) => {
    const vv = have ? safeBase64(have) : undefined;
  
    wss.handleUpgrade(request, socket, head, (ws) => {
@@ -404,7 +428,7 @@ index ab15362..3287340 100644
    });
  });
  
-@@ -116,9 +106,7 @@ async function shutdown(signal: string): Promise<void> {
+@@ -117,9 +107,7 @@ async function shutdown(signal: string): Promise<void> {
    if (shuttingDown) return;
    shuttingDown = true;
    console.log(`[marks] ${signal} received, flushing documents`);
@@ -415,6 +439,23 @@ index ab15362..3287340 100644
    server.close(() => process.exit(0));
    setTimeout(() => process.exit(0), 3_000).unref();
  }
+diff --git a/server/src/protocol.ts b/server/src/protocol.ts
+index 4c1f1fc..cb31afb 100644
+--- a/server/src/protocol.ts
++++ b/server/src/protocol.ts
+@@ -1,10 +1,10 @@
+ /**
+- * Wire protocol for the Loro sync rooms.
++ * Wire protocol for the ESBT sync rooms.
+  *
+  * Every frame is binary: one tag byte followed by an opaque payload. Keep this
+  * file in sync with `client/src/collab/protocol.ts`.
+  */
+-export const MSG_UPDATE = 0x01; //  both ways: Loro update or snapshot bytes
++export const MSG_UPDATE = 0x01; //  both ways: ESBT update or snapshot bytes
+ export const MSG_EPHEMERAL = 0x02; //  both ways: presence, relayed but never persisted
+ export const MSG_SERVER_VV = 0x03; //  server -> client: oplog version vector
+ export const MSG_SNAPSHOT = 0x04; //  server -> client: document snapshot
 diff --git a/server/src/seed.ts b/server/src/seed.ts
 index 4e5ea73..97fa582 100644
 --- a/server/src/seed.ts
@@ -441,7 +482,7 @@ index 4e5ea73..97fa582 100644
    console.log('[marks] seeded welcome document');
  }
 diff --git a/server/src/store.ts b/server/src/store.ts
-index 58b6d29..506073c 100644
+index 58b6d29..bc19b36 100644
 --- a/server/src/store.ts
 +++ b/server/src/store.ts
 @@ -4,7 +4,13 @@ import Database from 'better-sqlite3';
@@ -459,6 +500,24 @@ index 58b6d29..506073c 100644
  
  export interface DocumentRow {
    id: string;
+@@ -25,7 +31,7 @@ db.exec(`
+   CREATE TABLE IF NOT EXISTS documents (
+     id          TEXT PRIMARY KEY,
+     title       TEXT    NOT NULL DEFAULT 'Untitled',
+-    engine      TEXT    NOT NULL DEFAULT 'loro',
++    engine      TEXT    NOT NULL DEFAULT 'esbt',
+     state       BLOB,
+     chars       INTEGER NOT NULL DEFAULT 0,
+     created_at  INTEGER NOT NULL,
+@@ -85,7 +91,7 @@ export function createDocument(opts: {
+   const row = {
+     id: opts.id ?? nanoid(12),
+     title: opts.title ?? 'Untitled',
+-    engine: opts.engine ?? 'loro',
++    engine: opts.engine ?? 'esbt',
+     state: null,
+     chars: 0,
+     created_at: now,
 diff --git a/server/src/yjs-room.ts b/server/src/yjs-room.ts
 deleted file mode 100644
 index 0fb6ca8..0000000
