@@ -1,0 +1,33 @@
+{
+  "name": "@marks/esbt",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "ESBT sequence CRDT (Mechaoui & Imine, arXiv:2607.28101) — TypeScript engine implementing the marks editor contract: sync, merge, reconcile, undo, presence.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/maceip/ESBT-web"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "test": "npm run build && node --test dist/contract.test.js",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "typescript": "^5.9.3"
+  }
+}

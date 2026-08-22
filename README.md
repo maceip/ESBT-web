@@ -2,7 +2,13 @@
 
 Sequence CRDT from Mechaoui & Imine, [arXiv:2607.28101](https://arxiv.org/abs/2607.28101).
 
-Rust core, `wasm32-unknown-unknown`, one-page editor.
+Rust core, `wasm32-unknown-unknown`, one-page editor — plus a pure-TypeScript
+engine in [`ts/`](ts/) implementing the [marks](https://github.com/maceip/marks)
+editor contract (`@marks/esbt`: doc + sync + merge, per-peer undo, presence,
+weight anchors; no WASM). Its coverage audit against the Loro/Yjs surface marks
+used is [`ts/COVERAGE.md`](ts/COVERAGE.md), and the ready-to-apply integration
+that removes Loro and Yjs from marks is the patch series in
+[`patches/marks/`](patches/marks/).
 
 `extensions.md` is **not** in this tree (adaptive \(D_{\max}\), compact `sc`,
 Yjs/Automerge, partition-recovery study).

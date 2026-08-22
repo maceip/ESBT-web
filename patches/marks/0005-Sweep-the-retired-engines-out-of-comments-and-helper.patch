@@ -1,0 +1,110 @@
+From 58902e2d2e49fd339ab412fc931fb1b721170a84 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Sat, 22 Aug 2026 00:04:11 +0000
+Subject: [PATCH 5/6] Sweep the retired engines out of comments and helper
+ names
+
+Protocol headers describe ESBT rooms, comment cursors are documented as
+weight anchors, the surface-harness document factory loses its Loro
+name, and the editor exception-sink note no longer explains
+loro-codemirror internals.
+---
+ client/src/browser/catalog-cache.ts |  2 +-
+ client/src/browser/comments.ts      |  2 +-
+ client/src/collab/protocol.ts       |  2 +-
+ client/src/editor/setup.ts          | 10 ++++------
+ scripts/harness/suites/surface.mjs  |  6 +++---
+ 5 files changed, 10 insertions(+), 12 deletions(-)
+
+diff --git a/client/src/browser/catalog-cache.ts b/client/src/browser/catalog-cache.ts
+index c6f9aa5..3409998 100644
+--- a/client/src/browser/catalog-cache.ts
++++ b/client/src/browser/catalog-cache.ts
+@@ -7,7 +7,7 @@ const metaKey = (id: string) => `marks:meta:${id}`;
+ /**
+  * Last-known document list and per-id metadata.
+  *
+- * Used so opening a Yjs document while offline does not fall back to Loro
++ * Used so opening a legacy-engine document while offline is still refused
+  * (the two encodings are incompatible) and so the sidebar still lists
+  * documents the user already had. The network is always authoritative when
+  * it answers; the cache is never shown as fresher than it is.
+diff --git a/client/src/browser/comments.ts b/client/src/browser/comments.ts
+index 0971450..77bef8c 100644
+--- a/client/src/browser/comments.ts
++++ b/client/src/browser/comments.ts
+@@ -23,7 +23,7 @@ export interface CommentRecord {
+   to: number;
+   /** Selected markdown at creation, used to re-find the range. */
+   quote: string;
+-  /** Engine-encoded start cursor (Loro Cursor / Yjs relative position). */
++  /** Engine-encoded start cursor (an ESBT weight anchor). */
+   startCursor?: string;
+   endCursor?: string;
+ }
+diff --git a/client/src/collab/protocol.ts b/client/src/collab/protocol.ts
+index 96c56bd..9311226 100644
+--- a/client/src/collab/protocol.ts
++++ b/client/src/collab/protocol.ts
+@@ -1,5 +1,5 @@
+ /**
+- * Wire protocol for the Loro sync rooms.
++ * Wire protocol for the ESBT sync rooms.
+  * Keep this file in sync with `server/src/protocol.ts`.
+  */
+ export const MSG_UPDATE = 0x01;
+diff --git a/client/src/editor/setup.ts b/client/src/editor/setup.ts
+index 2c31d35..fc81f29 100644
+--- a/client/src/editor/setup.ts
++++ b/client/src/editor/setup.ts
+@@ -22,12 +22,10 @@ import { editorTheme, markdownHighlighting } from './theme';
+ /**
+  * Positions that briefly outrun the local document.
+  *
+- * The collaborative bindings resolve remote cursors and undo selections
+- * against the CRDT, which can be a step ahead of the editor while a change is
+- * still being applied — loro-codemirror restores an undo selection in the same
+- * transaction that rewrites the document, for instance. CodeMirror routes the
+- * failure here and recovers on the next update, so these are noise. Anything
+- * else deserves to be seen.
++ * The presence layer resolves remote cursors against the CRDT, which can be a
++ * step ahead of the editor while a change is still being applied. CodeMirror
++ * routes the failure here and recovers on the next update, so these are
++ * noise. Anything else deserves to be seen.
+  */
+ const TRANSIENT_BINDING_ERROR =
+   /Invalid position \d+ in document|No tile at position|property 'tile' of/;
+diff --git a/scripts/harness/suites/surface.mjs b/scripts/harness/suites/surface.mjs
+index ecf75c4..04918da 100644
+--- a/scripts/harness/suites/surface.mjs
++++ b/scripts/harness/suites/surface.mjs
+@@ -1,7 +1,7 @@
+ /**
+  * Portable browser-surface checks that every driver can run.
+  *
+- * Deep collab / two-peer / Yjs / REST cases stay in scripts/smoke.mjs
++ * Deep collab / two-peer / REST cases stay in scripts/smoke.mjs
+  * (Playwright). This suite covers the glass: create a doc, preview,
+  * select-all, context menu, comments, voice affordance, theme, offline.
+  */
+@@ -11,7 +11,7 @@ const FIXTURE = `# Surface harness
+ Hello from the portable suite.
+ `;
+ 
+-async function createLoroDocument(session) {
++async function createDocument(session) {
+   await session.goto('/');
+   try {
+     await session.waitForSelector('.new-doc .button.primary', { timeout: 8_000 });
+@@ -27,7 +27,7 @@ async function createLoroDocument(session) {
+ }
+ 
+ export async function runSurface(session, { check }) {
+-  await createLoroDocument(session);
++  await createDocument(session);
+   await session.waitForSelector('.cm-content', { timeout: 20_000 });
+   await session.wait(2000);
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,30 @@
+From 04e4cb8a1ce9703ff92304939170112d734603e7 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Sat, 22 Aug 2026 00:07:00 +0000
+Subject: [PATCH 6/6] Build the engine before typechecking dependents
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Client and server resolve @marks/esbt types from its dist declarations,
+so a fresh clone's npm run typecheck must build the engine workspace
+first — the same ordering dev and build already have.
+---
+ package.json | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/package.json b/package.json
+index aa0c1ff..95f07f2 100644
+--- a/package.json
++++ b/package.json
+@@ -19,6 +19,7 @@
+     "dev:client": "npm run dev --workspace=client",
+     "build": "npm run build --workspace=@marks/esbt && npm run build --workspace=client && npm run build --workspace=server",
+     "start": "npm run start --workspace=server",
++    "pretypecheck": "npm run build --workspace=@marks/esbt",
+     "typecheck": "npm run typecheck --workspace=@marks/esbt && npm run typecheck --workspace=client && npm run typecheck --workspace=server",
+     "clean": "rm -rf client/dist server/dist esbt/dist node_modules/.vite",
+     "test:esbt": "npm test --workspace=@marks/esbt",
+-- 
+2.43.0
+
