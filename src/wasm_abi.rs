@@ -2,6 +2,7 @@
 
 use crate::anchor::{Affinity, Anchor};
 use crate::clock::Version;
+use crate::config::DocumentConfig;
 use crate::document::{Document, LocalUpdate, SnapshotKind, SnapshotReceipt, UndoDisposition};
 use crate::error::{EngineError, ErrorCode};
 use std::cell::RefCell;
@@ -242,6 +243,37 @@ pub extern "C" fn esbt_doc_last_error_code() -> u32 {
 pub extern "C" fn esbt_doc_create(site_0: u32, site_1: u32, site_2: u32, site_3: u32) -> i32 {
     let site = site_from_words([site_0, site_1, site_2, site_3]);
     match Document::with_defaults(site)
+        .and_then(|document| DOCUMENTS.with(|documents| documents.borrow_mut().insert(document)))
+    {
+        Ok(handle) => {
+            clear_error();
+            handle as i32
+        }
+        Err(error) => fail(error),
+    }
+}
+
+/// Create a document from an encoded `DocumentConfig` (see `src/config.rs`
+/// for the exact byte layout). This is the browser's access to every policy
+/// native callers already have: `Dmax`, base, depth, the allocation
+/// strategy, the adaptive-`Dmax` controller, and per-document resource
+/// ceilings. Malformed or non-canonical config bytes fail typed.
+#[no_mangle]
+pub extern "C" fn esbt_doc_create_configured(
+    site_0: u32,
+    site_1: u32,
+    site_2: u32,
+    site_3: u32,
+    config_pointer: *const u8,
+    config_length: u32,
+) -> i32 {
+    let site = site_from_words([site_0, site_1, site_2, site_3]);
+    let bytes = match read_input(config_pointer, config_length) {
+        Ok(bytes) => bytes,
+        Err(error) => return fail(error),
+    };
+    match DocumentConfig::decode(&bytes)
+        .and_then(|config| Document::new(site, config.replica, config.limits))
         .and_then(|document| DOCUMENTS.with(|documents| documents.borrow_mut().insert(document)))
     {
         Ok(handle) => {
@@ -638,6 +670,46 @@ pub extern "C" fn esbt_doc_undo(handle: u32) -> i32 {
 pub extern "C" fn esbt_doc_redo(handle: u32) -> i32 {
     match with_document(handle, Document::redo) {
         Ok(update) => store_local_update(update),
+        Err(error) => fail(error),
+    }
+}
+
+/// Operations retained for reconnect/delta export — the quantity that grows
+/// without bound unless the client drives `esbt_doc_prune_history`. Poll it
+/// to schedule compaction.
+#[no_mangle]
+pub extern "C" fn esbt_doc_retained_operations(handle: u32) -> i32 {
+    match with_document(handle, |document| Ok(document.retained_operations())) {
+        Ok(count) => {
+            clear_error();
+            count.min(i32::MAX as usize) as i32
+        }
+        Err(error) => fail(error),
+    }
+}
+
+/// Store the encoded history floor: the causal prefix below which this
+/// document can no longer serve reconnect deltas and peers need a snapshot.
+#[no_mangle]
+pub extern "C" fn esbt_doc_history_floor(handle: u32) -> i32 {
+    match with_document(handle, |document| Ok(document.history_floor().encode())) {
+        Ok(floor) => {
+            clear_error();
+            store(floor)
+        }
+        Err(error) => fail(error),
+    }
+}
+
+/// Store the current `Dmax` as 8 little-endian bytes (it can exceed `i32`
+/// when the adaptive controller reaches its ceiling).
+#[no_mangle]
+pub extern "C" fn esbt_doc_current_dmax(handle: u32) -> i32 {
+    match with_document(handle, |document| Ok(document.current_dmax())) {
+        Ok(dmax) => {
+            clear_error();
+            store(dmax.to_le_bytes().to_vec())
+        }
         Err(error) => fail(error),
     }
 }

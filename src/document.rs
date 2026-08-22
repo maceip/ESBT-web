@@ -194,6 +194,19 @@ impl Document {
         self.replica.pending.len()
     }
 
+    /// Operations currently retained for reconnect and delta export. This is
+    /// the quantity that grows without bound unless the product calls
+    /// `prune_history_through`; expose it so clients can drive compaction.
+    pub fn retained_operations(&self) -> usize {
+        self.replica.log.len()
+    }
+
+    /// The `Dmax` currently in force (moves over time when the adaptive
+    /// controller is enabled).
+    pub fn current_dmax(&self) -> i64 {
+        self.replica.alloc.current_dmax()
+    }
+
     pub fn state_hash(&self) -> u64 {
         self.replica.hash_state()
     }

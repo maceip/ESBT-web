@@ -2,7 +2,7 @@
 
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { EsbtDocument, EsbtRuntime } from "../web/esbt-document.js";
+import { EsbtDocument, EsbtRuntime, encodeDocumentConfig } from "../web/esbt-document.js";
 
 const artifact = new URL(
   "../target/wasm32-unknown-unknown/release/esbt.wasm",
@@ -85,7 +85,35 @@ assert.equal(reconnectReceipt.visibleChanged, true);
 assert.equal(d.getText(), a.getText());
 const reconnectText = d.getText();
 
-for (const document of [a, b, c, d]) document.destroy();
+// Configured creation: adaptive Dmax, an alternate allocation strategy, and
+// a lower document ceiling all reach the engine through the config blob.
+const configured = await EsbtDocument.create({
+  runtime,
+  siteId: "5".padStart(32, "0"),
+  config: {
+    dmax: 64,
+    strategy: { kind: "boundary-low", boundary: 32 },
+    adaptiveDmax: { floor: 64, window: 16 },
+    limits: { maxDocumentUnits: 4 },
+  },
+});
+assert.equal(configured.currentDmax(), 64);
+configured.insert(0, "abcd");
+assert.throws(() => configured.insert(4, "e"), (error) => error.code === 15);
+assert.equal(configured.getText(), "abcd");
+assert.ok(encodeDocumentConfig({}).length > 0);
+
+// Compaction telemetry: retained journal count and history floor drive the
+// client's pruning policy.
+assert.ok(a.retainedOperations > 0);
+const beforePrune = a.retainedOperations;
+const pruned = a.pruneHistoryThrough(a.version());
+assert.equal(pruned, beforePrune);
+assert.equal(a.retainedOperations, 0);
+assert.ok(a.historyFloor().length > 0);
+assert.throws(() => a.exportUpdate(new Uint8Array([0, 0, 0, 0])), (error) => error.code === 21);
+
+for (const document of [a, b, c, d, configured]) document.destroy();
 
 console.log(
   JSON.stringify({

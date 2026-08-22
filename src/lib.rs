@@ -5,6 +5,7 @@ pub mod allocator;
 pub mod anchor;
 pub mod clock;
 mod codec;
+pub mod config;
 pub mod document;
 pub mod error;
 pub mod fraction;
@@ -25,6 +26,7 @@ pub mod wasm_abi;
 
 pub use allocator::{AdaptiveDmaxConfig, Allocator, DMAX_HARD_CEILING};
 pub use anchor::{Affinity, Anchor, AnchorRange, AnchorTarget};
+pub use config::DocumentConfig;
 pub use document::{Document, LocalUpdate, SnapshotKind, SnapshotReceipt, UndoDisposition};
 pub use error::{EngineError, ErrorCode};
 pub use limits::ResourceLimits;
