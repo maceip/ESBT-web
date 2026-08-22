@@ -53,9 +53,22 @@ pub enum SnapshotMergeError {
     SnapshotStateConflict,
 }
 
-/// Transient local intention state. A consecutive typing run keeps the first
-/// ESBT weight as a site-distinct prefix and appends an intra-run component.
-/// Concurrent runs then sort as units instead of alternating by character.
+/// Transient local intention state. A consecutive typing run roots at its
+/// first character's weight and appends an intra-run component per keystroke,
+/// so concurrent runs sort as units instead of alternating by character.
+///
+/// The reservation is lazy: the first character pays nothing — no
+/// site-discriminator suffix is minted until a run actually continues, and
+/// even then continuations extend the first character's own path. Freshly
+/// allocated candidates already end in a site-derived digit at the mediant
+/// and gap-midpoint layers, so concurrent first characters are distinct
+/// weights whose subtrees cannot nest. The one corner this trades away is
+/// the sequence-number ladder, whose candidates copy `left.sc` verbatim
+/// (paper Algorithm 2 line 21): two sites entering that ladder concurrently
+/// may interleave after their first characters. The eager alternative — a
+/// fixed-width full-site prefix on every insertion — made adversarial
+/// middle-insertion identifier depth grow several digits per operation,
+/// which is a far worse trade (see docs/extension-considerations.md).
 #[derive(Clone)]
 struct LocalInsertRun {
     root: Weight,
@@ -524,18 +537,24 @@ impl Replica {
                 )
             })?;
 
-            // NEWSEQ can choose the same midpoint at two sites before its
-            // fixed-depth tie is needed. Reserve a site-specific child of that
-            // midpoint when it remains in the chosen gap, so the run roots do
-            // not differ only by the final site tie-break.
-            let mut reserved = weight.clone();
-            reserved.sc.extend(self.alloc.site_discriminator(self.site));
-            let run_reserved =
-                left < reserved && reserved < immediate_right && !self.doc.contains(&reserved);
-            if run_reserved {
-                weight = reserved;
+            // Lazy run reservation: the first character is the run root and
+            // continuations mint children of this exact weight. The root must
+            // not be a weight another site can mint identically, or a twin
+            // would sort between the root and its continuations. Mediant and
+            // gap-midpoint candidates already end in this site's digit; the
+            // sn-ladder (which copies left.sc) and NEWSEQ midpoints do not,
+            // so those roots are marked with one site digit — down from the
+            // fixed-width full-site prefix that made adversarial
+            // middle-insertion depth grow by several digits per operation.
+            let site_digit = self.alloc.site_digit(self.site);
+            if weight.sc.last() != Some(&site_digit) {
+                let mut marked = weight.clone();
+                marked.sc.push(site_digit);
+                if left < marked && marked < immediate_right && !self.doc.contains(&marked) {
+                    weight = marked;
+                }
             }
-            self.local_insert_run = run_reserved.then(|| LocalInsertRun {
+            self.local_insert_run = Some(LocalInsertRun {
                 root: weight.clone(),
                 last: weight.clone(),
                 last_counter: 0,

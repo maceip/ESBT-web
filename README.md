@@ -76,9 +76,10 @@ literal transcription of the preprint:
 - every allocator candidate is checked strictly between its immediate
   neighbors, with an unbounded NEWSEQ retry and typed exhaustion when that
   exact gap has no representable identifier;
-- consecutive local insertions reserve a site-specific ESBT path prefix, so
-  concurrent typing runs remain contiguous rather than converging to a
-  character shuffle;
+- consecutive local insertions form a run rooted at the first character's
+  weight (site-marked with at most one extra digit when the allocator's
+  candidate is not already site-derived), so concurrent typing runs remain
+  contiguous rather than converging to a character shuffle;
 - reused weights order their insertion counters: a newer reuse waits behind an
   older live occupant, while an older reuse arriving late is suppressed;
 - document elements are UTF-16 code units, so Rust/Wasm indices exactly match

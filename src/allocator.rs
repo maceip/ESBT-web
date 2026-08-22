@@ -276,30 +276,8 @@ impl Allocator {
         !f.is_begin() && !f.is_end() && f.p < self.dmax && f.q < self.dmax
     }
 
-    fn site_digit(&self, site: SiteId) -> u32 {
+    pub(crate) fn site_digit(&self, site: SiteId) -> u32 {
         1 + (site % u128::from(self.base - 1)) as u32
-    }
-
-    /// Fixed-width, prefix-free base-`base` representation of the full site
-    /// identity. Unlike the paper's one-digit depth tie, this remains distinct
-    /// for sites that collide modulo `base - 1` and is therefore suitable for
-    /// reserving a complete local typing run.
-    pub fn site_discriminator(&self, site: SiteId) -> Vec<u32> {
-        let radix = u128::from(self.base.max(2));
-        let mut remaining_max = u128::MAX;
-        let mut width = 0usize;
-        while remaining_max != 0 {
-            remaining_max /= radix;
-            width += 1;
-        }
-
-        let mut value = site;
-        let mut digits = vec![1u32; width];
-        for digit in digits.iter_mut().rev() {
-            *digit = (value % radix) as u32 + 1;
-            value /= radix;
-        }
-        digits
     }
 
     pub(crate) fn begin_transaction(&mut self) -> bool {

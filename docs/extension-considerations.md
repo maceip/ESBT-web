@@ -214,11 +214,12 @@ redundancies exist:
 
 Measured on this repository after implementation
 (`tests/identifier_size.rs`; same engine and weights, format v1 recomputed
-from its closed-form fixed-width layout — no external numbers): a 220-unit
-two-site concurrent typing-run snapshot shrinks from 17,734 to 2,380 bytes
-(−86.6%), a 400-operation mixed-editing journal shrinks from 43,254 to
-13,690 bytes (−68.3%), and a single insertion operation drops from 101 to
-31 bytes.
+from its closed-form fixed-width layout — no external numbers, and quoted
+here together with the lazy run-reservation change below): a 220-unit
+two-site concurrent typing-run snapshot shrinks from 13,334 to 2,370 bytes
+(−82.2%), a 400-operation mixed-editing journal shrinks from 33,558 to
+11,266 bytes (−66.4%), and a single insertion operation drops from 81 to
+26 bytes.
 
 ## Extension 3 — ESBT as a pluggable identifier allocation strategy
 
@@ -307,15 +308,36 @@ snapshot; `BoundaryLow(64)` trades deeper mean paths (46.8 vs 38.8
 components) for an 8% smaller journal. On the synthetic 10,000-op
 adversarial middle-insertion pattern the strategy seam matters far more:
 `BoundaryLow(64)` emits 175 MB of journal against midpoint's 275 MB (−36%).
-That workload also quantifies a real engine trade-off the evaluation
-surfaced: this repository's typing-run reservation (site-discriminator
-prefixes) amplifies sequence-path depth under adversarial middle insertion
-(mean ≈17,500 components at 10,000 ops on a bare `Replica`); the production
-`Document` boundary already fails such mints typed (`IdentifierTooDeep`)
-instead of emitting weights peers would reject, and boundary editing is
-unaffected (constant depth ≤ 7). The adaptive controller correctly stays
-idle on the real trace — at the default bound the fraction layer is never
-pressured — which is the designed behavior, not a gap.
+That workload also quantified a real engine trade-off the evaluation
+surfaced — and drove a fix. The original typing-run reservation appended a
+fixed-width full-site discriminator (5–6 digits at the production base) to
+*every* first insertion, which amplified sequence-path depth under
+adversarial middle insertion to a mean of ≈17,500 components at 10,000 ops
+on a bare `Replica`. The production `Document` boundary already failed such
+mints typed (`IdentifierTooDeep`), but availability suffered.
+
+**Follow-up: lazy site-marked run roots.** True laziness (pay nothing until
+a run continues) is provably impossible for twin-prone roots: any
+continuation of a first character `C` sorts after every same-`(f,sn,sc)`
+twin of `C`, so contiguity must be established at the first character or
+never. What *is* safe is observing that mediant- and gap-midpoint-layer
+candidates already end in a site-derived digit — their subtrees cannot
+collide — while sn-ladder candidates (which copy `left.sc`, paper
+Algorithm 2 line 21) and NEWSEQ midpoints do not. The reservation now roots
+the run at the first character's own weight and appends at most **one**
+site digit, only when the candidate is not already site-derived. The
+certainty of the old fixed-width prefix degrades to
+whp-contiguity (site pairs colliding modulo `base − 1`, ≈2⁻³¹ at the
+production base; convergence is unaffected either way, and every pinned
+contiguity test still passes). Measured effect: adversarial middle
+insertion drops from a mean path depth of 17,499 to 7,498 and from a 275 MB
+to a 175 MB journal (replay 13.2 s → 4.7 s; `BoundaryLow(64)` now 75 MB);
+boundary typing drops from constant depth 6–7 to 1–2; the real-trace
+journal shrinks 20.8 MB → 15.3 MB (−27%) with mean path depth 38.8 → 15.6.
+
+The adaptive controller correctly stays idle on the real trace — at the
+default bound the fraction layer is never pressured — which is the designed
+behavior, not a gap.
 
 ## Extension 4 — adverse network conditions
 
