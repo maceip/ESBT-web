@@ -1,3 +1,5 @@
+<img width="312" src="https://github.com/user-attachments/assets/f7b8dd53-a616-4f5b-922a-d9e2d8622edd" />
+
 # esbt
 
 a sequence crdt for collaborative text editing, built from the extended
