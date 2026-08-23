@@ -21,6 +21,62 @@ pub struct OperationRef {
     pub sequence: u64,
 }
 
+/// One visible UTF-16 replacement, in coordinates of the document state
+/// produced by the preceding edit in the same receipt. It is deliberately
+/// separate from CRDT operations: consumers can patch an editor or preview
+/// without decoding weights, scanning, or copying the whole document.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VisibleEdit {
+    pub from: usize,
+    pub to: usize,
+    pub inserted: Vec<u16>,
+}
+
+impl VisibleEdit {
+    pub fn new(from: usize, to: usize, inserted: Vec<u16>) -> Self {
+        Self { from, to, inserted }
+    }
+}
+
+/// Coalesce the overwhelmingly common typing/deletion runs while preserving
+/// sequential coordinates for disjoint concurrent changes.
+pub(crate) fn push_visible_edit(edits: &mut Vec<VisibleEdit>, edit: VisibleEdit) {
+    if edit.from == edit.to && edit.inserted.is_empty() {
+        return;
+    }
+    if let Some(previous) = edits.last_mut() {
+        // Append a character to an insertion or replacement that was just
+        // applied. `edit.from` is in the post-previous coordinate space.
+        if edit.from == edit.to
+            && !edit.inserted.is_empty()
+            && edit.from == previous.from.saturating_add(previous.inserted.len())
+        {
+            previous.inserted.extend(edit.inserted);
+            return;
+        }
+        // Repeatedly deleting at one cursor is one replacement against the
+        // pre-run state.
+        if edit.inserted.is_empty()
+            && previous.inserted.is_empty()
+            && edit.from == previous.from
+            && edit.to >= edit.from
+        {
+            previous.to = previous.to.saturating_add(edit.to - edit.from);
+            return;
+        }
+        // A replace is implemented as delete then insert at the same cursor.
+        if previous.inserted.is_empty()
+            && previous.to > previous.from
+            && edit.from == edit.to
+            && edit.from == previous.from
+        {
+            previous.inserted.extend(edit.inserted);
+            return;
+        }
+    }
+    edits.push(edit);
+}
+
 impl OperationRef {
     pub const fn new(origin: SiteId, sequence: u64) -> Self {
         Self { origin, sequence }
@@ -265,6 +321,9 @@ pub struct ApplyReceipt {
     pub newly_ready_operations: Vec<OperationRef>,
     pub version: Version,
     pub visible_changed: bool,
+    /// Exact visible replacements caused by this apply, without a full-text
+    /// materialization. Buffered or duplicate operations contribute none.
+    pub visible_edits: Vec<VisibleEdit>,
     /// Exact canonical bytes a durable room should append. `None` means the
     /// update was empty or entirely duplicate and needs no second journal row.
     pub journal_bytes: Option<Vec<u8>>,

@@ -13,9 +13,10 @@ use crate::weight::SiteId;
 /// `AlternatingByDepth` is LSEQ's strategy alternation made deterministic by
 /// depth parity instead of cached coin flips, preserving this engine's
 /// reproducibility and rollback guarantees.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AllocationStrategy {
     /// Bisect the gap (paper Algorithm 1 line 16).
+    #[default]
     Midpoint,
     /// Allocate close above the left neighbor, at most `boundary` away —
     /// dense for append-leaning workloads.
@@ -25,12 +26,6 @@ pub enum AllocationStrategy {
     BoundaryHigh(u32),
     /// Boundary-low at even depths, boundary-high at odd depths.
     AlternatingByDepth(u32),
-}
-
-impl Default for AllocationStrategy {
-    fn default() -> Self {
-        AllocationStrategy::Midpoint
-    }
 }
 
 impl AllocationStrategy {
@@ -45,7 +40,7 @@ impl AllocationStrategy {
             }
             AllocationStrategy::AlternatingByDepth(boundary) => {
                 let bounded = boundary.max(1).min(interval);
-                if depth % 2 == 0 {
+                if depth.is_multiple_of(2) {
                     bounded
                 } else {
                     interval - bounded + 1

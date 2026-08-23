@@ -5,11 +5,22 @@ use crate::clock::Version;
 use crate::config::DocumentConfig;
 use crate::document::{Document, LocalUpdate, SnapshotKind, SnapshotReceipt, UndoDisposition};
 use crate::error::{EngineError, ErrorCode};
+use crate::update::VisibleEdit;
 use std::cell::RefCell;
 use std::collections::HashMap;
 
+/// The exact browser ABI travels inside the artifact. Consumers compare this
+/// custom section with their generated binding before accepting any export.
+#[link_section = "esbt.abi"]
+#[used]
+static ESBT_WASM_ABI: [u8; include_bytes!("../abi/esbt-wasm-v1.json").len()] =
+    *include_bytes!("../abi/esbt-wasm-v1.json");
+
 const MAX_DOCUMENTS: usize = 1_024;
-const MAX_ABI_ALLOCATION: usize = 16 * 1024 * 1024;
+/// Marks' product profile admits 64 MiB compact snapshots. This is an ABI
+/// allocation ceiling, not a document policy: configured `ResourceLimits`
+/// remain the authority for each handle.
+const MAX_ABI_ALLOCATION: usize = 64 * 1024 * 1024;
 
 thread_local! {
     static LAST: RefCell<Vec<u8>> = RefCell::new(Vec::new());
@@ -22,6 +33,7 @@ thread_local! {
 struct DocumentStore {
     next_handle: u32,
     documents: HashMap<u32, Document>,
+    last_visible_edits: HashMap<u32, Vec<VisibleEdit>>,
 }
 
 impl DocumentStore {
@@ -37,6 +49,7 @@ impl DocumentStore {
             if !self.documents.contains_key(&self.next_handle) {
                 let handle = self.next_handle;
                 self.documents.insert(handle, document);
+                self.last_visible_edits.insert(handle, Vec::new());
                 return Ok(handle);
             }
         }
@@ -145,14 +158,62 @@ fn encode_utf16(units: &[u16]) -> Vec<u8> {
     out
 }
 
-fn store_local_update(update: Option<LocalUpdate>) -> i32 {
+fn set_visible_edits(handle: u32, edits: Vec<VisibleEdit>) {
+    DOCUMENTS.with(|documents| {
+        documents
+            .borrow_mut()
+            .last_visible_edits
+            .insert(handle, edits);
+    });
+}
+
+fn encode_visible_edits(edits: &[VisibleEdit]) -> Result<Vec<u8>, EngineError> {
+    let count = u32::try_from(edits.len()).map_err(|_| {
+        EngineError::new(
+            ErrorCode::IntegerOverflow,
+            "visible edit count exceeds the Wasm ABI",
+        )
+    })?;
+    let mut out = Vec::new();
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&count.to_le_bytes());
+    for edit in edits {
+        let from = u32::try_from(edit.from).map_err(|_| {
+            EngineError::new(
+                ErrorCode::IntegerOverflow,
+                "visible edit start exceeds the Wasm ABI",
+            )
+        })?;
+        let to = u32::try_from(edit.to).map_err(|_| {
+            EngineError::new(
+                ErrorCode::IntegerOverflow,
+                "visible edit end exceeds the Wasm ABI",
+            )
+        })?;
+        let inserted = u32::try_from(edit.inserted.len()).map_err(|_| {
+            EngineError::new(
+                ErrorCode::IntegerOverflow,
+                "visible edit insertion exceeds the Wasm ABI",
+            )
+        })?;
+        out.extend_from_slice(&from.to_le_bytes());
+        out.extend_from_slice(&to.to_le_bytes());
+        out.extend_from_slice(&inserted.to_le_bytes());
+        out.extend_from_slice(&encode_utf16(&edit.inserted));
+    }
+    Ok(out)
+}
+
+fn store_local_update(handle: u32, update: Option<LocalUpdate>) -> i32 {
     clear_error();
     match update {
         Some(update) => {
+            set_visible_edits(handle, update.visible_edits);
             store(update.canonical_bytes);
             1
         }
         None => {
+            set_visible_edits(handle, Vec::new());
             store(Vec::new());
             0
         }
@@ -286,7 +347,11 @@ pub extern "C" fn esbt_doc_create_configured(
 
 #[no_mangle]
 pub extern "C" fn esbt_doc_destroy(handle: u32) -> i32 {
-    let removed = DOCUMENTS.with(|documents| documents.borrow_mut().documents.remove(&handle));
+    let removed = DOCUMENTS.with(|documents| {
+        let mut documents = documents.borrow_mut();
+        documents.last_visible_edits.remove(&handle);
+        documents.documents.remove(&handle)
+    });
     if removed.is_some() {
         clear_error();
         0
@@ -343,6 +408,27 @@ pub extern "C" fn esbt_doc_text_utf16(handle: u32) -> i32 {
     }
 }
 
+/// Visible UTF-16 replacements produced by the most recent successful
+/// mutating call on this handle. Reading them is O(changes), not O(document).
+#[no_mangle]
+pub extern "C" fn esbt_doc_visible_edits(handle: u32) -> i32 {
+    let edits = DOCUMENTS.with(|documents| {
+        documents
+            .borrow()
+            .last_visible_edits
+            .get(&handle)
+            .cloned()
+            .ok_or_else(invalid_handle)
+    });
+    match edits.and_then(|edits| encode_visible_edits(&edits)) {
+        Ok(encoded) => {
+            clear_error();
+            store(encoded)
+        }
+        Err(error) => fail(error),
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn esbt_doc_site(handle: u32) -> i32 {
     match with_document(handle, |document| Ok(document.site())) {
@@ -386,7 +472,7 @@ pub extern "C" fn esbt_doc_begin(
 #[no_mangle]
 pub extern "C" fn esbt_doc_commit(handle: u32) -> i32 {
     match with_document(handle, Document::commit_transaction) {
-        Ok(update) => store_local_update(update),
+        Ok(update) => store_local_update(handle, update),
         Err(error) => fail(error),
     }
 }
@@ -425,7 +511,7 @@ pub extern "C" fn esbt_doc_insert_utf16(
     match with_document(handle, |document| {
         document.insert_utf16(index as usize, &units, group)
     }) {
-        Ok(update) => store_local_update(update),
+        Ok(update) => store_local_update(handle, update),
         Err(error) => fail(error),
     }
 }
@@ -443,7 +529,7 @@ pub extern "C" fn esbt_doc_delete(
     match with_document(handle, |document| {
         document.delete(index as usize, length as usize, group)
     }) {
-        Ok(update) => store_local_update(update),
+        Ok(update) => store_local_update(handle, update),
         Err(error) => fail(error),
     }
 }
@@ -471,7 +557,7 @@ pub extern "C" fn esbt_doc_replace_utf16(
     match with_document(handle, |document| {
         document.replace_range_utf16(from as usize, to as usize, &units, group)
     }) {
-        Ok(update) => store_local_update(update),
+        Ok(update) => store_local_update(handle, update),
         Err(error) => fail(error),
     }
 }
@@ -485,6 +571,7 @@ pub extern "C" fn esbt_doc_apply(handle: u32, pointer: *const u8, length: u32) -
     match with_document(handle, |document| document.apply_bytes(&bytes)) {
         Ok(receipt) => {
             clear_error();
+            set_visible_edits(handle, receipt.visible_edits.clone());
             store(receipt.encode())
         }
         Err(error) => fail(error),
@@ -544,6 +631,7 @@ pub extern "C" fn esbt_doc_apply_snapshot(handle: u32, pointer: *const u8, lengt
     match with_document(handle, |document| document.apply_snapshot_bytes(&bytes)) {
         Ok(receipt) => {
             clear_error();
+            set_visible_edits(handle, receipt.visible_edits.clone());
             store(encode_snapshot_receipt(&receipt))
         }
         Err(error) => fail(error),
@@ -621,9 +709,16 @@ pub extern "C" fn esbt_doc_insert_at_anchor_utf16(
     }) {
         Ok((update, caret)) => {
             let anchor = caret.encode();
-            let update = update
-                .map(|update| update.canonical_bytes)
-                .unwrap_or_default();
+            let update = match update {
+                Some(update) => {
+                    set_visible_edits(handle, update.visible_edits);
+                    update.canonical_bytes
+                }
+                None => {
+                    set_visible_edits(handle, Vec::new());
+                    Vec::new()
+                }
+            };
             let mut result = Vec::new();
             result.extend_from_slice(&(anchor.len() as u32).to_le_bytes());
             result.extend_from_slice(&anchor);
@@ -661,7 +756,7 @@ pub extern "C" fn esbt_doc_can_redo(handle: u32) -> i32 {
 #[no_mangle]
 pub extern "C" fn esbt_doc_undo(handle: u32) -> i32 {
     match with_document(handle, Document::undo) {
-        Ok(update) => store_local_update(update),
+        Ok(update) => store_local_update(handle, update),
         Err(error) => fail(error),
     }
 }
@@ -669,7 +764,7 @@ pub extern "C" fn esbt_doc_undo(handle: u32) -> i32 {
 #[no_mangle]
 pub extern "C" fn esbt_doc_redo(handle: u32) -> i32 {
     match with_document(handle, Document::redo) {
-        Ok(update) => store_local_update(update),
+        Ok(update) => store_local_update(handle, update),
         Err(error) => fail(error),
     }
 }

@@ -250,8 +250,8 @@ Automerge uses RGA-style op IDs. There is no component that "allocates a
 position identifier between two neighbors" to swap out — the paper's phrasing
 presumes a Logoot/LSEQ-shaped host. A literal reading therefore requires
 forking Yjs's `Item#integrate` or Automerge's op tree, which is (a) outside
-this repository's declared boundary (the engine repo owns the CRDT; the
-frozen `ts/` package is explicitly not to be shipped), and (b) would not
+this repository's declared boundary (the engine repo owns the CRDT and has
+no second browser implementation), and (b) would not
 produce ESBT-in-Yjs but a new CRDT wearing Yjs's API.
 
 Where a real allocation seam *does* exist in shipping frameworks is the

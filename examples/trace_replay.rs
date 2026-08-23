@@ -222,10 +222,7 @@ fn synthetic(pattern: &str, operations: usize) -> Vec<Edit> {
             }
             other => panic!("unknown pattern {other}"),
         };
-        edits.push(Edit::Insert {
-            position,
-            unit,
-        });
+        edits.push(Edit::Insert { position, unit });
         len += 1;
     }
     edits
@@ -285,8 +282,16 @@ fn run_workload(label: &str, edits: &[Edit]) {
     );
     let strategies: [(&'static str, AllocationStrategy, Option<AdaptiveDmaxConfig>); 5] = [
         ("midpoint (paper)", AllocationStrategy::Midpoint, None),
-        ("boundary-low(64)", AllocationStrategy::BoundaryLow(64), None),
-        ("boundary-high(64)", AllocationStrategy::BoundaryHigh(64), None),
+        (
+            "boundary-low(64)",
+            AllocationStrategy::BoundaryLow(64),
+            None,
+        ),
+        (
+            "boundary-high(64)",
+            AllocationStrategy::BoundaryHigh(64),
+            None,
+        ),
         (
             "alternating(64)",
             AllocationStrategy::AlternatingByDepth(64),

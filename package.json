@@ -5,7 +5,10 @@
   "scripts": {
     "demo": "node demo/server.mjs",
     "showcase": "node demo/showcase.mjs",
-    "test:wasm": "node demo/wasm-smoke.mjs"
+    "build:wasm": "bash tools/build-wasm.sh",
+    "generate:abi": "node tools/wasm-abi.mjs",
+    "check:abi": "node tools/wasm-abi.mjs --check",
+    "test:wasm": "npm run build:wasm && node tools/wasm-abi.mjs --check --verify-wasm web/esbt.wasm && node demo/wasm-smoke.mjs"
   },
   "dependencies": {
     "playwright": "^1.55.0",

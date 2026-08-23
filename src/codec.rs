@@ -522,9 +522,13 @@ mod tests {
             Some(longest_common_prefix(&previous, &weight.sc)),
         );
         let mut reader = Reader::new(&bytes);
-        let decoded =
-            read_weight_parts(&mut reader, &limits, SiteContext::Table(&[7]), Some(&previous))
-                .expect("front-coded decode");
+        let decoded = read_weight_parts(
+            &mut reader,
+            &limits,
+            SiteContext::Table(&[7]),
+            Some(&previous),
+        )
+        .expect("front-coded decode");
         assert_eq!(decoded, weight);
         assert!(reader.is_finished());
 
@@ -532,7 +536,12 @@ mod tests {
         let mut lazy = Vec::new();
         write_weight_parts(&mut lazy, &weight, SiteContext::Table(&[7]), Some(1));
         let mut reader = Reader::new(&lazy);
-        assert!(read_weight_parts(&mut reader, &limits, SiteContext::Table(&[7]), Some(&previous))
-            .is_err());
+        assert!(read_weight_parts(
+            &mut reader,
+            &limits,
+            SiteContext::Table(&[7]),
+            Some(&previous)
+        )
+        .is_err());
     }
 }

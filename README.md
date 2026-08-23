@@ -22,8 +22,8 @@ concurrent editing.
 - `web/esbt-document.js` — the browser adapter over the `esbt_doc_*` wasm
   abi: transactions, anchors, undo/redo, reconnect deltas, and configurable
   documents
-- `ts/` — a frozen typescript reference, kept only for behavioral
-  comparison; do not ship it
+- `tests/` — deterministic convergence, adverse-network, recovery, codec,
+  and identifier-size evidence against the production Rust engine
 - `docs/` — design notes: the paper's four future-work extensions
   (implemented here, with measurements) and the client integration guide
 

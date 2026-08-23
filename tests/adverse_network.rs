@@ -7,8 +7,8 @@
 //! is a pure function of its seed, so any failure replays exactly. Run with
 //! `-- --nocapture` to see the recorded measurements.
 
-use esbt::{Document, ErrorCode, ResourceLimits};
 use esbt::replica::ReplicaConfig;
+use esbt::{Document, ErrorCode, ResourceLimits};
 
 fn xorshift(state: &mut u64) -> u64 {
     *state ^= *state << 13;
@@ -100,7 +100,9 @@ impl Sim {
                 .expect("local insert")
         } else {
             let index = (xorshift(&mut self.rng) as usize) % len;
-            self.docs[target].delete(index, 1, None).expect("local delete")
+            self.docs[target]
+                .delete(index, 1, None)
+                .expect("local delete")
         };
         if let Some(update) = update {
             self.broadcast(target, update.canonical_bytes);
@@ -185,7 +187,9 @@ impl Sim {
                     .export_update(&remote)
                     .expect("export reconnect delta");
                 exchanged += bytes.len();
-                self.docs[to].apply_bytes(&bytes).expect("apply reconnect delta");
+                self.docs[to]
+                    .apply_bytes(&bytes)
+                    .expect("apply reconnect delta");
             }
         }
         exchanged
@@ -289,7 +293,9 @@ fn prolonged_disconnection_survives_history_compaction() {
     // Recovery path: C rebases onto A's compact snapshot. Its offline edits
     // are retained journal, so the merge replays them instead of losing them.
     let snapshot = a.export_compact_snapshot().expect("compact snapshot");
-    let receipt = c.apply_snapshot_bytes(&snapshot).expect("rebase onto snapshot");
+    let receipt = c
+        .apply_snapshot_bytes(&snapshot)
+        .expect("rebase onto snapshot");
     assert!(c.text().contains("[offline-edit]"), "offline edits lost");
     assert!(c.text().contains("shared base "), "base lost");
 
@@ -321,7 +327,9 @@ fn sparse_receipts_refuse_to_pose_as_a_merge_base() {
     let second = source.insert(1, "B", None).expect("second").unwrap();
 
     let mut sparse = Document::with_defaults(2).expect("sparse");
-    sparse.apply_bytes(&second.canonical_bytes).expect("second only");
+    sparse
+        .apply_bytes(&second.canonical_bytes)
+        .expect("second only");
     assert_eq!(sparse.text(), "B");
 
     let refusal = sparse
@@ -347,26 +355,36 @@ fn crash_recovery_restores_pending_state_and_identity() {
     let own = b.insert(0, "kept", None).expect("own edit").unwrap();
 
     // The delete reaches B before its insertion: causally buffered.
-    b.apply_bytes(&delete.canonical_bytes).expect("early delete");
+    b.apply_bytes(&delete.canonical_bytes)
+        .expect("early delete");
     assert_eq!(b.pending_len(), 1);
 
     // B crashes; only its persisted full archive survives.
     let archive = b.export_full_snapshot().expect("persist archive");
     let mut restored = Document::with_defaults(2).expect("restored");
-    restored.apply_snapshot_bytes(&archive).expect("restore archive");
+    restored
+        .apply_snapshot_bytes(&archive)
+        .expect("restore archive");
     assert_eq!(restored.pending_len(), 1, "pending op lost in the crash");
     assert_eq!(restored.text(), b.text());
     assert_eq!(restored.state_hash(), b.state_hash());
 
     // The missing insertion resolves the buffered delete after recovery.
-    restored.apply_bytes(&insert.canonical_bytes).expect("late insert");
+    restored
+        .apply_bytes(&insert.canonical_bytes)
+        .expect("late insert");
     assert_eq!(restored.pending_len(), 0);
     assert_eq!(restored.text(), "kept");
 
     // Identity resumes: new local edits reuse no (origin, seq) or counter.
-    let next = restored.insert(0, "y", None).expect("post-crash edit").unwrap();
-    a.apply_bytes(&own.canonical_bytes).expect("a pre-crash edit");
-    a.apply_bytes(&next.canonical_bytes).expect("a post-crash edit");
+    let next = restored
+        .insert(0, "y", None)
+        .expect("post-crash edit")
+        .unwrap();
+    a.apply_bytes(&own.canonical_bytes)
+        .expect("a pre-crash edit");
+    a.apply_bytes(&next.canonical_bytes)
+        .expect("a post-crash edit");
     let catch_up = restored.export_update(&a.version()).expect("catch-up");
     a.apply_bytes(&catch_up).expect("apply catch-up");
     let back = a.export_update(&restored.version()).expect("back-fill");

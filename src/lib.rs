@@ -35,5 +35,5 @@ pub use op::{Op, OpKind};
 pub use orderkey::{key_between, order_key, weight_from_order_key};
 pub use replica::{Replica, ReplicaConfig, SnapshotMergeError};
 pub use snapshot::{FullSnapshot, Snapshot};
-pub use update::{ApplyOutcome, ApplyReceipt, OperationRef, Update};
+pub use update::{ApplyOutcome, ApplyReceipt, OperationRef, Update, VisibleEdit};
 pub use weight::Weight;

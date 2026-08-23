@@ -7,7 +7,9 @@ use crate::limits::ResourceLimits;
 use crate::op::{Op, OpKind};
 use crate::replica::{LocalTransactionCheckpoint, Replica, ReplicaConfig, SnapshotMergeError};
 use crate::snapshot::{FullSnapshot, Message, Snapshot};
-use crate::update::{ApplyOutcome, ApplyReceipt, OperationRef, Update};
+use crate::update::{
+    push_visible_edit, ApplyOutcome, ApplyReceipt, OperationRef, Update, VisibleEdit,
+};
 use crate::weight::{SiteId, Weight};
 use std::collections::{BTreeSet, HashMap};
 
@@ -19,6 +21,7 @@ pub struct LocalUpdate {
     /// Exact retry-safe `ESBM` bytes emitted once after the local state commits.
     pub canonical_bytes: Vec<u8>,
     pub visible_changed: bool,
+    pub visible_edits: Vec<VisibleEdit>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,6 +42,7 @@ pub struct SnapshotReceipt {
     pub kind: SnapshotKind,
     pub version: Version,
     pub visible_changed: bool,
+    pub visible_edits: Vec<VisibleEdit>,
     pub undo: UndoDisposition,
 }
 
@@ -68,6 +72,7 @@ struct TransactionState {
     checkpoint: LocalTransactionCheckpoint,
     operations: Vec<Op>,
     undo_actions: Vec<UndoAction>,
+    visible_edits: Vec<VisibleEdit>,
     undo_group: Option<u64>,
     mode: TransactionMode,
 }
@@ -106,6 +111,29 @@ fn normalize_undo_actions(actions: Vec<UndoAction>) -> Vec<UndoAction> {
     }
 
     normalized.into_iter().flatten().collect()
+}
+
+fn replacement_between(before: &[u16], after: &[u16]) -> Vec<VisibleEdit> {
+    let mut from = 0;
+    let shortest = before.len().min(after.len());
+    while from < shortest && before[from] == after[from] {
+        from += 1;
+    }
+    let mut before_end = before.len();
+    let mut after_end = after.len();
+    while before_end > from && after_end > from && before[before_end - 1] == after[after_end - 1] {
+        before_end -= 1;
+        after_end -= 1;
+    }
+    if from == before_end && from == after_end {
+        Vec::new()
+    } else {
+        vec![VisibleEdit::new(
+            from,
+            before_end,
+            after[from..after_end].to_vec(),
+        )]
+    }
 }
 
 #[derive(Clone)]
@@ -245,6 +273,7 @@ impl Document {
             checkpoint,
             operations: Vec::new(),
             undo_actions: Vec::new(),
+            visible_edits: Vec::new(),
             undo_group,
             mode,
         });
@@ -264,7 +293,7 @@ impl Document {
     }
 
     fn commit_transaction_inner(&mut self) -> Result<Option<LocalUpdate>, EngineError> {
-        let transaction = self.transaction.take().ok_or_else(|| {
+        let mut transaction = self.transaction.take().ok_or_else(|| {
             EngineError::new(ErrorCode::NoActiveTransaction, "no transaction to commit")
         })?;
         if transaction.operations.is_empty() {
@@ -341,7 +370,6 @@ impl Document {
         }
 
         let normalized_actions = normalize_undo_actions(transaction.undo_actions.clone());
-        let visible_changed = !normalized_actions.is_empty();
         let record = UndoRecord {
             actions: normalized_actions,
             group: transaction.undo_group,
@@ -358,12 +386,15 @@ impl Document {
         }
 
         self.replica.commit_local_transaction();
-        self.replica.drain_weights(touched_weights.iter());
+        for edit in self.replica.drain_weights(touched_weights.iter()) {
+            push_visible_edit(&mut transaction.visible_edits, edit);
+        }
 
         Ok(Some(LocalUpdate {
             update,
             canonical_bytes,
-            visible_changed,
+            visible_changed: !transaction.visible_edits.is_empty(),
+            visible_edits: transaction.visible_edits,
         }))
     }
 
@@ -615,6 +646,10 @@ impl Document {
             let transaction = self.transaction.as_mut().expect("checked transaction");
             transaction.operations.push(operation);
             transaction.undo_actions.push(action);
+            push_visible_edit(
+                &mut transaction.visible_edits,
+                VisibleEdit::new(index + offset, index + offset, vec![unit]),
+            );
             if identifier_too_deep {
                 return Err(EngineError::new(
                     ErrorCode::IdentifierTooDeep,
@@ -664,6 +699,10 @@ impl Document {
                 deleted_counter: counter,
                 deletion,
             });
+            push_visible_edit(
+                &mut transaction.visible_edits,
+                VisibleEdit::new(index, index + 1, Vec::new()),
+            );
         }
         Ok(())
     }
@@ -826,6 +865,10 @@ impl Document {
                     deleted_counter: *counter,
                     deletion,
                 });
+                push_visible_edit(
+                    &mut transaction.visible_edits,
+                    VisibleEdit::new(index, index + 1, Vec::new()),
+                );
             }
             UndoAction::RestoreDeleted {
                 weight,
@@ -883,9 +926,23 @@ impl Document {
                     weight: operation.weight.clone(),
                     counter: operation.counter,
                 };
+                let visible_index =
+                    self.replica
+                        .doc
+                        .index_of(&operation.weight)
+                        .ok_or_else(|| {
+                            EngineError::new(
+                                ErrorCode::InvalidRange,
+                                "undo insertion is not visible",
+                            )
+                        })?;
                 let transaction = self.transaction.as_mut().expect("undo transaction");
                 transaction.operations.push(operation);
                 transaction.undo_actions.push(action);
+                push_visible_edit(
+                    &mut transaction.visible_edits,
+                    VisibleEdit::new(visible_index, visible_index, vec![*unit]),
+                );
                 if identifier_too_deep {
                     return Err(EngineError::new(
                         ErrorCode::IdentifierTooDeep,
@@ -1058,8 +1115,8 @@ impl Document {
             .iter()
             .map(OperationRef::from)
             .collect();
-        let before_revision = self.replica.visible_revision();
-        self.replica
+        let visible_edits = self
+            .replica
             .admit_validated_operations(admitted.into_iter().cloned());
 
         let after_pending: BTreeSet<_> = self
@@ -1096,7 +1153,7 @@ impl Document {
             ApplyOutcome::Mixed
         };
 
-        let visible_changed = before_revision != self.replica.visible_revision();
+        let visible_changed = !visible_edits.is_empty();
         Ok(ApplyReceipt {
             outcome,
             accepted_operations,
@@ -1105,6 +1162,7 @@ impl Document {
             newly_ready_operations,
             version: self.replica.version.clone(),
             visible_changed,
+            visible_edits,
             journal_bytes,
         })
     }
@@ -1192,10 +1250,13 @@ impl Document {
             }
         };
         staged.validate_state()?;
+        let after_units = staged.utf16_units();
+        let visible_edits = replacement_between(&before_units, &after_units);
         let receipt = SnapshotReceipt {
             kind,
             version: staged.version(),
-            visible_changed: before_units != staged.utf16_units(),
+            visible_changed: !visible_edits.is_empty(),
+            visible_edits,
             undo,
         };
         *self = staged;
@@ -1491,14 +1552,68 @@ mod tests {
             .expect("commit")
             .expect("local update");
         assert_eq!(local.update.len(), 8);
+        assert_eq!(
+            local.visible_edits,
+            vec![VisibleEdit::new(0, 0, "hello 😀".encode_utf16().collect())]
+        );
 
         let mut b = Document::with_defaults(2).expect("document");
         let receipt = b.apply_bytes(&local.canonical_bytes).expect("apply");
         assert_eq!(receipt.outcome, ApplyOutcome::Applied);
+        assert_eq!(receipt.visible_edits, local.visible_edits);
         assert_eq!(a.text(), b.text());
         let duplicate = b.apply_bytes(&local.canonical_bytes).expect("retry");
         assert_eq!(duplicate.outcome, ApplyOutcome::Duplicate);
         assert!(duplicate.journal_bytes.is_none());
+        assert!(duplicate.visible_edits.is_empty());
+    }
+
+    #[test]
+    fn visible_receipts_patch_replacements_and_undo_without_full_text() {
+        let mut source = Document::with_defaults(1).expect("source");
+        let seed = source
+            .insert(0, "one 😀 three", None)
+            .expect("seed")
+            .expect("seed update");
+        let mut target = Document::with_defaults(2).expect("target");
+        target
+            .apply_bytes(&seed.canonical_bytes)
+            .expect("seed apply");
+
+        let replacement = source
+            .replace_range_utf16(4, 6, &"two".encode_utf16().collect::<Vec<_>>(), None)
+            .expect("replace")
+            .expect("replace update");
+        assert_eq!(
+            replacement.visible_edits,
+            vec![VisibleEdit::new(
+                4,
+                6,
+                "two".encode_utf16().collect::<Vec<_>>()
+            )]
+        );
+        let remote = target
+            .apply_bytes(&replacement.canonical_bytes)
+            .expect("remote replace");
+        assert_eq!(remote.visible_edits, replacement.visible_edits);
+        assert_eq!(target.text(), source.text());
+
+        let before_undo: Vec<u16> = source.text().encode_utf16().collect();
+        let undo = source.undo().expect("undo").expect("undo update");
+        assert!(!undo.visible_edits.is_empty());
+        let remote_undo = target
+            .apply_bytes(&undo.canonical_bytes)
+            .expect("remote undo");
+        let apply = |mut units: Vec<u16>, edits: &[VisibleEdit]| {
+            for edit in edits {
+                units.splice(edit.from..edit.to, edit.inserted.iter().copied());
+            }
+            units
+        };
+        let expected: Vec<u16> = source.text().encode_utf16().collect();
+        assert_eq!(apply(before_undo.clone(), &undo.visible_edits), expected);
+        assert_eq!(apply(before_undo, &remote_undo.visible_edits), expected);
+        assert_eq!(target.text(), source.text());
     }
 
     #[test]

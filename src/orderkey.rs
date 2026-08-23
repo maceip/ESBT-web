@@ -44,7 +44,7 @@ const PATH_DIGIT: u8 = 0x01;
 /// `[significant-byte count][big-endian bytes]`: longer values sort after
 /// shorter ones, so byte order equals numeric order.
 fn push_ordered(out: &mut Vec<u8>, value: u64, complement: bool) {
-    let significant = ((64 - u64::from(value | 1).leading_zeros()) as usize).div_ceil(8);
+    let significant = ((64 - (value | 1).leading_zeros()) as usize).div_ceil(8);
     let start = out.len();
     out.push(significant as u8);
     out.extend_from_slice(&value.to_be_bytes()[8 - significant..]);
@@ -135,7 +135,10 @@ fn fraction_from_runs(runs: &[(bool, u64)]) -> Result<Fraction, EngineError> {
             "key fraction is out of range",
         ));
     }
-    Ok(Fraction { p: p as i64, q: q as i64 })
+    Ok(Fraction {
+        p: p as i64,
+        q: q as i64,
+    })
 }
 
 /// Encode a document weight as an order-preserving, prefix-free byte key.
@@ -158,10 +161,7 @@ pub fn order_key(weight: &Weight) -> Vec<u8> {
 
 /// Exact inverse of `order_key`. Only the canonical byte form of a weight is
 /// accepted: the decoded weight is re-encoded and compared.
-pub fn weight_from_order_key(
-    bytes: &[u8],
-    limits: &ResourceLimits,
-) -> Result<Weight, EngineError> {
+pub fn weight_from_order_key(bytes: &[u8], limits: &ResourceLimits) -> Result<Weight, EngineError> {
     if bytes.len() > limits.max_message_bytes {
         return Err(EngineError::new(
             ErrorCode::MessageTooLarge,
@@ -186,7 +186,10 @@ pub fn weight_from_order_key(
             // coefficients; anything longer cannot decode to a valid weight.
             return Err(EngineError::malformed("order key fraction is too deep"));
         }
-        if runs.last().is_some_and(|(previous, _)| *previous == is_right) {
+        if runs
+            .last()
+            .is_some_and(|(previous, _)| *previous == is_right)
+        {
             return Err(EngineError::new(
                 ErrorCode::NonCanonicalEncoding,
                 "fraction runs do not alternate",
@@ -294,12 +297,14 @@ pub fn key_between(
             "order keys are not an ascending gap",
         ));
     }
-    let weight = allocator.create_weight(&left, &right, site).ok_or_else(|| {
-        EngineError::new(
-            ErrorCode::AllocationExhausted,
-            "the requested key gap has no available identifier",
-        )
-    })?;
+    let weight = allocator
+        .create_weight(&left, &right, site)
+        .ok_or_else(|| {
+            EngineError::new(
+                ErrorCode::AllocationExhausted,
+                "the requested key gap has no available identifier",
+            )
+        })?;
     Ok(order_key(&weight))
 }
 

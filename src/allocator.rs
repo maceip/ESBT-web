@@ -305,10 +305,8 @@ impl Allocator {
     pub fn create_weight(&mut self, left: &Weight, right: &Weight, site: SiteId) -> Option<Weight> {
         if self.adaptive.is_some() {
             let mediant = left.f.mediant(right.f);
-            let separates = !mediant.is_begin()
-                && !mediant.is_end()
-                && left.f < mediant
-                && mediant < right.f;
+            let separates =
+                !mediant.is_begin() && !mediant.is_end() && left.f < mediant && mediant < right.f;
             if separates {
                 let accepted = self.mediant_fits(mediant);
                 let dmax = self.dmax;
@@ -325,7 +323,12 @@ impl Allocator {
         allocated
     }
 
-    fn create_weight_inner(&mut self, left: &Weight, right: &Weight, site: SiteId) -> Option<Weight> {
+    fn create_weight_inner(
+        &mut self,
+        left: &Weight,
+        right: &Weight,
+        site: SiteId,
+    ) -> Option<Weight> {
         debug_assert!(left < right, "CREATE_WEIGHT requires w1 prec w2");
         let between = |weight: Weight| (left < &weight && &weight < right).then_some(weight);
         let fm = left.f.mediant(right.f);

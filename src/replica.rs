@@ -1,12 +1,13 @@
 //! Algorithm 3 — per-replica control, plus join snapshot and op log.
 
 use crate::allocator::{AdaptiveDmaxConfig, Allocator};
-use crate::newseq::AllocationStrategy;
 use crate::clock::{SiteReceiptCheckpoint, Version};
 use crate::error::{EngineError, ErrorCode};
+use crate::newseq::AllocationStrategy;
 use crate::op::{Op, OpKind};
 use crate::rbtree::DocTree;
 use crate::snapshot::{Atom, Snapshot};
+use crate::update::{push_visible_edit, VisibleEdit};
 use crate::weight::{SiteId, Weight};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
@@ -269,10 +270,6 @@ impl Replica {
 
     pub fn text(&self) -> String {
         self.doc.text()
-    }
-
-    pub(crate) fn visible_revision(&self) -> u128 {
-        self.visible_revision
     }
 
     /// Project the exact final queue, tombstone count, and visible length for
@@ -571,9 +568,9 @@ impl Replica {
         let seq = self.try_stamp()?;
         let op = Op::ins(w, unit, c, self.site, seq);
         self.log.insert((self.site, seq), op.clone());
-        self.apply_ready(&op);
+        let _ = self.apply_ready(&op);
         if !self.alloc.transaction_active() {
-            self.drain_weight(&op.weight);
+            let _ = self.drain_weight(&op.weight);
         }
         if let Some(run) = self.local_insert_run.as_mut() {
             if run.last == op.weight {
@@ -605,9 +602,9 @@ impl Replica {
         let seq = self.try_stamp()?;
         let op = Op::del(w.clone(), c, self.site, seq);
         self.log.insert((self.site, seq), op.clone());
-        self.apply_ready(&op);
+        let _ = self.apply_ready(&op);
         if !self.alloc.transaction_active() {
-            self.drain_weight(&op.weight);
+            let _ = self.drain_weight(&op.weight);
         }
         Ok(Some(op))
     }
@@ -639,9 +636,9 @@ impl Replica {
         let operation = Op::ins(weight.clone(), unit, counter, self.site, sequence);
         self.counter_map.insert(weight, counter);
         self.log.insert((self.site, sequence), operation.clone());
-        self.apply_ready(&operation);
+        let _ = self.apply_ready(&operation);
         if !self.alloc.transaction_active() {
-            self.drain_weight(&operation.weight);
+            let _ = self.drain_weight(&operation.weight);
         }
         Ok(operation)
     }
@@ -734,27 +731,30 @@ impl Replica {
                 ));
             }
         }
-        self.admit_validated_operation(op);
+        let _ = self.admit_validated_operation(op);
         Ok(true)
     }
 
     /// Reconstruct retained journal and pending state after a full archive has
     /// been structurally decoded and cross-validated against its snapshot.
     pub(crate) fn restore_validated_operations(&mut self, operations: &[Op]) {
-        self.admit_validated_operations(operations.iter().cloned());
+        let _ = self.admit_validated_operations(operations.iter().cloned());
     }
 
     /// Apply an operation after the caller has resolved every fallible identity
     /// and resource decision. Keeping this phase infallible lets a document
     /// reject an update before its first mutation without cloning all state.
-    pub(crate) fn admit_validated_operation(&mut self, op: Op) {
-        self.admit_validated_operations(std::iter::once(op));
+    pub(crate) fn admit_validated_operation(&mut self, op: Op) -> Vec<VisibleEdit> {
+        self.admit_validated_operations(std::iter::once(op))
     }
 
     /// Admit an already validated atomic batch and drain each affected weight
     /// once. This keeps a large transaction linear in its own operations rather
     /// than repeatedly rescanning the same causal bucket after every item.
-    pub(crate) fn admit_validated_operations(&mut self, operations: impl IntoIterator<Item = Op>) {
+    pub(crate) fn admit_validated_operations(
+        &mut self,
+        operations: impl IntoIterator<Item = Op>,
+    ) -> Vec<VisibleEdit> {
         let mut touched = BTreeSet::new();
         for op in operations {
             if matches!(op.kind, OpKind::Ins { .. }) {
@@ -771,24 +771,36 @@ impl Replica {
             touched.insert(op.weight.clone());
             self.pending.push_back(op);
         }
+        let mut edits = Vec::new();
         for weight in touched {
-            self.drain_weight(&weight);
+            for edit in self.drain_weight(&weight) {
+                push_visible_edit(&mut edits, edit);
+            }
         }
+        edits
     }
 
     pub fn drain(&mut self) {
         for weight in self.pending.weights() {
-            self.drain_weight(&weight);
+            let _ = self.drain_weight(&weight);
         }
     }
 
-    pub(crate) fn drain_weights<'a>(&mut self, weights: impl IntoIterator<Item = &'a Weight>) {
+    pub(crate) fn drain_weights<'a>(
+        &mut self,
+        weights: impl IntoIterator<Item = &'a Weight>,
+    ) -> Vec<VisibleEdit> {
+        let mut edits = Vec::new();
         for weight in weights {
-            self.drain_weight(weight);
+            for edit in self.drain_weight(weight) {
+                push_visible_edit(&mut edits, edit);
+            }
         }
+        edits
     }
 
-    fn drain_weight(&mut self, weight: &Weight) {
+    fn drain_weight(&mut self, weight: &Weight) -> Vec<VisibleEdit> {
+        let mut edits = Vec::new();
         let mut pending = self.pending.take(weight);
         let mut progressed = true;
         while progressed {
@@ -799,7 +811,9 @@ impl Replica {
                     let Some(op) = pending.remove(i) else {
                         break;
                     };
-                    self.apply_ready(&op);
+                    if let Some(edit) = self.apply_ready(&op) {
+                        push_visible_edit(&mut edits, edit);
+                    }
                     progressed = true;
                 } else if self.should_ignore(&pending[i]) {
                     let Some(op) = pending.remove(i) else {
@@ -836,6 +850,7 @@ impl Replica {
             }
         }
         self.pending.replace(weight.clone(), pending);
+        edits
     }
 
     /// Algorithm 3, refined by Scenario 3: a deletion targets (ω, c),
@@ -879,27 +894,37 @@ impl Replica {
         }
     }
 
-    fn apply_ready(&mut self, op: &Op) {
+    fn apply_ready(&mut self, op: &Op) -> Option<VisibleEdit> {
         match op.kind {
             OpKind::Ins { unit } => {
                 if self.delete_log.remove(&(op.weight.clone(), op.counter)) {
-                    return;
+                    return None;
                 }
                 if self.doc.contains(&op.weight) {
-                    return;
+                    return None;
                 }
                 if self.doc.insert(op.weight.clone(), unit, op.counter) {
                     self.counter_map.insert(op.weight.clone(), op.counter);
                     self.visible_revision = self.visible_revision.wrapping_add(1);
+                    let index = self
+                        .doc
+                        .index_of(&op.weight)
+                        .expect("inserted weight is visible");
+                    return Some(VisibleEdit::new(index, index, vec![unit]));
                 }
             }
             OpKind::Del => {
+                let index = self.doc.index_of(&op.weight);
                 if self.doc.delete(&op.weight) {
                     self.counter_map.remove(&op.weight);
                     self.visible_revision = self.visible_revision.wrapping_add(1);
+                    if let Some(index) = index {
+                        return Some(VisibleEdit::new(index, index + 1, Vec::new()));
+                    }
                 }
             }
         }
+        None
     }
 
     pub fn snapshot(&self) -> Snapshot {

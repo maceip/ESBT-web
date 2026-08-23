@@ -1,7 +1,9 @@
 /** Production browser owner for the Rust `Document` Wasm API. */
 
+import { checkedEsbtExports } from "./esbt-abi.generated.js";
+
 const textDecoder = new TextDecoder();
-const MAX_ABI_BYTES = 16 * 1024 * 1024;
+const MAX_ABI_BYTES = 64 * 1024 * 1024;
 
 export class EsbtError extends Error {
   constructor(code, message) {
@@ -19,9 +21,17 @@ export class EsbtRuntime {
   static async load(url = "./esbt.wasm") {
     const response = await fetch(url);
     if (!response.ok) throw new Error(`esbt: failed to fetch Wasm (${response.status})`);
-    const bytes = await response.arrayBuffer();
-    const { instance } = await WebAssembly.instantiate(bytes, { env: {} });
-    return new EsbtRuntime(instance.exports);
+    const fallback = response.clone();
+    if (typeof WebAssembly.instantiateStreaming === "function") {
+      try {
+        const { module, instance } = await WebAssembly.instantiateStreaming(response, { env: {} });
+        return new EsbtRuntime(checkedEsbtExports(module, instance.exports));
+      } catch {
+        // Development servers sometimes omit application/wasm.
+      }
+    }
+    const { module, instance } = await WebAssembly.instantiate(await fallback.arrayBuffer(), { env: {} });
+    return new EsbtRuntime(checkedEsbtExports(module, instance.exports));
   }
 
   memory() {
@@ -348,7 +358,9 @@ export class EsbtDocument {
     const nextAnchor = reader.bytes(reader.u32());
     const update = reader.bytes(reader.u32());
     reader.finish();
-    if (update.length > 0) this.emitLocalUpdate(update, options.origin);
+    if (update.length > 0) {
+      this.emitLocalUpdate(update, this.readVisibleEdits(), options.origin);
+    }
     return { anchor: nextAnchor, update: update.length > 0 ? update : null };
   }
 
@@ -359,7 +371,13 @@ export class EsbtDocument {
       return this.runtime.last();
     });
     const receipt = decodeApplyReceipt(receiptBytes);
-    if (receipt.visibleChanged) this.emitChange(undefined, false);
+    receipt.visibleEdits = this.readVisibleEdits();
+    if (receipt.visibleChanged !== (receipt.visibleEdits.length > 0)) {
+      throw new EsbtError(4, "esbt: apply receipt disagrees with visible edits");
+    }
+    if (receipt.visibleEdits.length > 0) {
+      this.emitChange(receipt.visibleEdits, undefined, false);
+    }
     return receipt;
   }
 
@@ -372,7 +390,13 @@ export class EsbtDocument {
       return this.runtime.last();
     });
     const receipt = decodeSnapshotReceipt(receiptBytes);
-    if (receipt.visibleChanged) this.emitChange(undefined, false);
+    receipt.visibleEdits = this.readVisibleEdits();
+    if (receipt.visibleChanged !== (receipt.visibleEdits.length > 0)) {
+      throw new EsbtError(4, "esbt: snapshot receipt disagrees with visible edits");
+    }
+    if (receipt.visibleEdits.length > 0) {
+      this.emitChange(receipt.visibleEdits, undefined, false);
+    }
     return receipt;
   }
 
@@ -472,11 +496,11 @@ export class EsbtDocument {
   consumeLocalResult(result, origin) {
     if (result === 0) return null;
     const update = this.runtime.last();
-    this.emitLocalUpdate(update, origin);
+    this.emitLocalUpdate(update, this.readVisibleEdits(), origin);
     return update;
   }
 
-  emitLocalUpdate(update, origin) {
+  emitLocalUpdate(update, edits, origin) {
     const stable = update.slice();
     for (const listener of [...this.localUpdateListeners]) {
       try {
@@ -485,12 +509,17 @@ export class EsbtDocument {
         surfaceListenerError(error);
       }
     }
-    this.emitChange(origin, true);
+    if (edits.length > 0) this.emitChange(edits, origin, true);
   }
 
-  emitChange(origin, local) {
+  readVisibleEdits() {
+    this.runtime.check(this.runtime.exports.esbt_doc_visible_edits(this.handle));
+    return decodeVisibleEdits(this.runtime.last());
+  }
+
+  emitChange(edits, origin, local) {
     if (this.changeListeners.size === 0) return;
-    const event = { text: this.getText(), origin, local };
+    const event = { edits: edits.map((edit) => ({ ...edit })), origin, local };
     for (const listener of [...this.changeListeners]) {
       try {
         listener(event);
@@ -592,6 +621,24 @@ function decodeUtf16(bytes) {
   return chunks.join("");
 }
 
+function decodeVisibleEdits(bytes) {
+  const reader = new ByteReader(bytes);
+  if (reader.u16() !== 1) throw new EsbtError(5, "esbt: unsupported visible-edit receipt");
+  const count = reader.u32();
+  const edits = [];
+  for (let index = 0; index < count; index++) {
+    const from = reader.u32();
+    const to = reader.u32();
+    const units = reader.u32();
+    if (to < from || units > 1_000_000) {
+      throw new EsbtError(4, "esbt: invalid visible-edit range");
+    }
+    edits.push({ from, to, insert: decodeUtf16(reader.bytes(units * 2)) });
+  }
+  reader.finish();
+  return edits;
+}
+
 function envelopeTag(bytes) {
   if (
     !(bytes instanceof Uint8Array) ||
@@ -633,6 +680,7 @@ function decodeApplyReceipt(bytes) {
     newlyReadyOperations: lists[3],
     version,
     journalBytes: journal.length > 0 ? journal : null,
+    visibleEdits: [],
   };
 }
 
@@ -645,7 +693,7 @@ function decodeSnapshotReceipt(bytes) {
   if (!undo) throw new EsbtError(4, "esbt: invalid snapshot undo disposition");
   const version = reader.bytes(reader.u32());
   reader.finish();
-  return { kind, visibleChanged, undo, version };
+  return { kind, visibleChanged, undo, version, visibleEdits: [] };
 }
 
 class ByteReader {

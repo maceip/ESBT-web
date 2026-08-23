@@ -54,8 +54,16 @@ pub fn run_all() -> (u32, u32, String) {
             &mid.to_string(),
         );
     }
-    check("NEWSEQ ex1", newseq(&[3], &[7], 10, 3, 2, AllocationStrategy::Midpoint) == vec![5], "");
-    check("NEWSEQ ex2", newseq(&[3], &[4], 10, 3, 2, AllocationStrategy::Midpoint) == vec![3, 5], "");
+    check(
+        "NEWSEQ ex1",
+        newseq(&[3], &[7], 10, 3, 2, AllocationStrategy::Midpoint) == vec![5],
+        "",
+    );
+    check(
+        "NEWSEQ ex2",
+        newseq(&[3], &[4], 10, 3, 2, AllocationStrategy::Midpoint) == vec![3, 5],
+        "",
+    );
 
     {
         let mut a = Allocator::new(10, 10, 3);
