@@ -1,0 +1,94 @@
+# Deterministic engine CI. Every gate runs from one exact checkout: the
+# pinned Rust 1.95.0 native suite, warnings-as-errors lint, the locked
+# Node 24 component build with binary/WIT verification, and a clean-tree
+# proof that the checked-in generated bindings and golden vectors match
+# this exact source revision. Downstream consumers (Marks) promote an
+# exact 40-character SHA only after this workflow has passed on it.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Superseded pull-request runs are cancelled; push runs are keyed by the
+# exact revision and never cancel each other.
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  ESBT_RUST_TOOLCHAIN: '1.95.0'
+
+jobs:
+  engine:
+    name: native suite, lint, component, and drift
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout the exact revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Restore Rust build state
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-rust-1.95.0-${{ hashFiles('Cargo.lock') }}
+
+      - name: Install pinned Rust 1.95.0
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: '1.95.0'
+          components: clippy, rustfmt
+          targets: wasm32-unknown-unknown
+
+      - name: Rust format
+        run: cargo fmt --all --check
+
+      - name: Rust native suite
+        run: cargo test --locked --all-targets
+
+      - name: Rust warnings-as-errors lint
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Setup Node.js v24
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Locked dependency install
+        run: npm ci
+
+      - name: Component build, binary/WIT verification, mesh, smoke, and large edit
+        run: npm run test:component
+
+      - name: Refuse generated-artifact drift
+        shell: bash
+        run: |
+          status=$(git status --porcelain=v1)
+          if [ -n "$status" ]; then
+            echo "generation is not reproducible from this exact source revision:" >&2
+            echo "$status" >&2
+            git --no-pager diff >&2
+            exit 1
+          fi
+
+      - name: Upload component and WIT as short-lived debugging artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: esbt-component-${{ github.sha }}
+          retention-days: 7
+          if-no-files-found: error
+          path: |
+            target/wasm32-unknown-unknown/release/esbt.component.wasm
+            target/wasm32-unknown-unknown/release/esbt.component.wit
+            web/generated/
