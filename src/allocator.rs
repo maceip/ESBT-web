@@ -233,7 +233,7 @@ pub struct Allocator {
 impl Allocator {
     pub fn new(dmax: i64, base: u32, depth: u32) -> Self {
         Allocator {
-            dmax: dmax.max(2),
+            dmax: dmax.clamp(2, DMAX_HARD_CEILING),
             base: base.max(2),
             depth: depth.max(1),
             strategy: AllocationStrategy::default(),

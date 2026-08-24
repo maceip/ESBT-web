@@ -2,7 +2,7 @@
 //! deterministic simulation testing (the FoundationDB/turmoil discipline)
 //! over the production `Document` API.
 //!
-//! A seeded discrete-event network delivers canonical `ESBM` update bytes
+//! A seeded discrete-event network delivers canonical ESBT Update artifacts
 //! with delay, loss, duplication, reordering, and partitions; every scenario
 //! is a pure function of its seed, so any failure replays exactly. Run with
 //! `-- --nocapture` to see the recorded measurements.
@@ -248,7 +248,7 @@ fn partition_heals_through_membership_anti_entropy() {
         sim.delivered_bytes,
     );
     // A second round exchanges only empty canonical updates.
-    let empty_update = esbt::snapshot::Message::Update(esbt::Update::default())
+    let empty_update = esbt::Artifact::Update(esbt::Update::default())
         .encode()
         .len();
     let empty_round = sim.docs.len() * (sim.docs.len() - 1) * empty_update;

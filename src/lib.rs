@@ -20,12 +20,13 @@ pub mod update;
 #[cfg(test)]
 pub mod verify;
 pub mod weight;
+pub mod wire;
 
 #[cfg(target_arch = "wasm32")]
-pub mod wasm_abi;
+mod component;
 
 pub use allocator::{AdaptiveDmaxConfig, Allocator, DMAX_HARD_CEILING};
-pub use anchor::{Affinity, Anchor, AnchorRange, AnchorTarget};
+pub use anchor::{Affinity, Anchor, AnchorRange, AnchorTarget, CausalPosition};
 pub use config::DocumentConfig;
 pub use document::{Document, LocalUpdate, SnapshotKind, SnapshotReceipt, UndoDisposition};
 pub use error::{EngineError, ErrorCode};
@@ -37,3 +38,4 @@ pub use replica::{Replica, ReplicaConfig, SnapshotMergeError};
 pub use snapshot::{FullSnapshot, Snapshot};
 pub use update::{ApplyOutcome, ApplyReceipt, OperationRef, Update, VisibleEdit};
 pub use weight::Weight;
+pub use wire::{Artifact, ArtifactKind, WIRE_FORMAT_VERSION};

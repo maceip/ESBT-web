@@ -183,9 +183,9 @@ redundancies exist:
    double the canonicality surface. The two techniques from that lineage
    that *do* fit are taken: LEB128 varints and dictionary/reference encoding
    of repeated 16-byte site IDs.
-4. **Picked: structure-aware weight codec v2 + sorted-context prefix
-   sharing**, as engine format version 2 (the repository's explicit
-   no-legacy-decoder policy makes a clean break correct):
+4. **Picked: structure-aware weight codec + sorted-context prefix sharing**,
+   incorporated into the one unified ESBT artifact codec (the repository's
+   explicit no-legacy-decoder policy makes a clean break correct):
    - a per-weight flags byte marks `sn = 0` (omitted), `sc = [0]` (omitted),
      and, in operations, `site = origin` (omitted — free 16-byte saving on
      every insertion, justified by the invariant the replica already
@@ -213,24 +213,26 @@ redundancies exist:
    with Extension 1, which needs encoded size as its cost signal.
 
 Measured on this repository after implementation
-(`tests/identifier_size.rs`; same engine and weights, format v1 recomputed
-from its closed-form fixed-width layout — no external numbers, and quoted
+(`tests/identifier_size.rs`; same engine and weights, the retired fixed-width
+prototype recomputed from its closed-form layout — no external numbers, and quoted
 here together with the lazy run-reservation change below): a 220-unit
-two-site concurrent typing-run snapshot shrinks from 13,334 to 2,370 bytes
+two-site concurrent typing-run snapshot shrinks from 13,356 to 2,375 bytes
 (−82.2%), a 400-operation mixed-editing journal shrinks from 33,558 to
-11,266 bytes (−66.4%) with standalone per-operation encoding, and a single
-insertion operation drops from 81 to 26 bytes.
+17,666 bytes (−47.4%) when each operation is wrapped as its own complete
+Update artifact, and a single complete insertion Update drops from 81 to 42
+bytes. These artifact measurements include the 11-byte unified ESBT envelope.
 
-**Follow-up (format v3): the update payload itself.** Per-operation
+**Follow-up: compact the update payload itself.** Per-operation
 encoding still repeated the 16-byte origin and a 4-byte length prefix per
-operation. Version 3 gives update payloads the same treatment snapshots
+operation. The canonical Update payload gives updates the same treatment as snapshots
 already had: a sorted per-update site dictionary (origins and weight sites
 become varint indexes), self-delimiting varint operation records, and
 sequence paths front-coded across the canonically `(origin, seq)`-sorted
 operation list — which places each typing run's weights adjacently, so run
-roots are paid once per update. The same 400-operation batch as one v3
-update message is 5,665 bytes against 35,173 for v1 (−83.9%) and roughly
-half of the per-operation v2 sum. Downstream, the adverse-network suite's
+roots are paid once per update. The same 400-operation batch as one canonical
+Update artifact is 5,665 bytes against 35,173 for the fixed-width prototype
+(−83.9%) and roughly one third of the standalone complete-artifact sum. Downstream,
+the adverse-network suite's
 measured recovery traffic dropped accordingly (partition-heal round
 6,591 → 2,891 bytes; offline reconnect delta 518 → 211 bytes; crash archive
 419 → 331 bytes).
@@ -275,7 +277,8 @@ Those hosts accept any generator of totally ordered keys with a
    different intention-preservation behavior cannot be made convergent in
    general (the same concurrent edits legitimately order differently), so
    the "integration" would be unsound rather than pluggable.
-4. **Picked (three coordinated pieces):**
+4. **Implemented as bounded adjacent research, not claimed as the literal
+   host integration:**
    - **a. Pluggable allocation strategy inside the allocator.** The digit
      choice inside `NEWSEQ` becomes a strategy value (`Midpoint` — the
      paper's algorithm and the default; `BoundaryLow(w)` / `BoundaryHigh(w)`
@@ -297,27 +300,34 @@ Those hosts accept any generator of totally ordered keys with a
      as order-preserving varints behind a low terminator (shorter path
      precedes, matching `sc_cmp`), and the site as a fixed big-endian
      tiebreak. `key_between(left?, right?, site)` mints a new key strictly
-     inside the gap. This is the actual integration surface for "existing
-     frameworks": any system that can store sortable byte strings — Loro's
-     tree slot, Figma-style documents, an indexed database column — can now
-     use ESBT as its identifier allocation strategy without adopting the
-     replica, which is precisely the pluggability the paper asks for,
-     delivered at the seam that exists rather than the seam that doesn't.
+     inside the gap. This is an **experimental native sortable-key adapter**
+     for a host that already has that seam. It is not exported through WIT,
+     is not part of the ESBT document codec, and is not wired into Marks,
+     Yjs, Automerge, or Loro.
    - **c. Real-world workload evaluation.** A trace-replay harness
      (`examples/trace_replay.rs`) consumes the automerge-perf real-keystroke
      editing-trace format — the corpus the Yjs and Automerge communities
      benchmark with — plus deterministic synthetic adversarial patterns, and
      reports per-strategy allocation-layer histograms, encoded identifier
-     bytes (v2 codec), and snapshot sizes. The evaluation compares this
+     bytes (the canonical weight codec), and snapshot sizes. The evaluation compares this
      engine's own strategies against each other, faithfully to the survey
      ruling that no external system is similar enough to donate its numbers.
+
+**Scope verdict:** the repository does not satisfy the paper's literal
+"integrate into Yjs or Automerge" request. It establishes an internal
+strategy seam, implements and tests a sortable-key reinterpretation, and
+evaluates those pieces on a real trace. Calling that a completed framework
+integration would require a pinned external host adapter and host-level
+convergence/performance evidence, neither of which exists here. Keeping the
+adapter native-only also avoids creating a seventh document artifact or a
+second host protocol merely to make the claim look broader.
 
 ### Recorded results (`cargo run --release --example trace_replay`)
 
 Replaying the automerge-perf real-keystroke trace (259,778 edits; the replay
 is validated by reproducing the corpus's known final document, 104,852
 units): every strategy converges to the same document; the paper's midpoint
-produces a 20.8 MB v2-encoded journal (≈80 B/op) and a 1.30 MB compact
+produces a 20.8 MB compact-encoded journal (≈80 B/op) and a 1.30 MB compact
 snapshot; `BoundaryLow(64)` trades deeper mean paths (46.8 vs 38.8
 components) for an 8% smaller journal. On the synthetic 10,000-op
 adversarial middle-insertion pattern the strategy seam matters far more:
@@ -443,5 +453,5 @@ The suite is deterministic; every number below replays exactly from its seed.
 - **Chaos schedules** (12 distinct seeds × 300 events, partitions forming
   and healing mid-traffic every 50 ticks, 15% drop / 10% duplicate):
   every seed converges in **one** anti-entropy round after the final heal
-  (5,105–6,795 recovery bytes with format v3; pending high-water 17–35),
+  (5,105–6,795 recovery bytes with the canonical Update artifact; pending high-water 17–35),
   and no pending operation survives convergence.

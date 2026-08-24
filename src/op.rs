@@ -1,7 +1,9 @@
 //! INS(ω, e, c) and DEL(ω, c). Paper §4.2 / §5.2.
 
+#[cfg(test)]
 use crate::codec::{read_weight, write_uvarint, write_weight, Reader, MIN_WEIGHT_BYTES};
 use crate::error::{EngineError, ErrorCode};
+#[cfg(test)]
 use crate::limits::ResourceLimits;
 use crate::weight::{SiteId, Weight};
 
@@ -50,12 +52,32 @@ impl Op {
         matches!(self.kind, OpKind::Ins { .. })
     }
 
+    /// Validate every invariant shared by native and wire-created operations.
+    pub fn validate(&self, max_identifier_depth: Option<usize>) -> Result<(), EngineError> {
+        if self.origin == 0 || self.seq == 0 || self.counter == 0 {
+            return Err(EngineError::new(
+                ErrorCode::InvalidOperation,
+                "operation identities must be nonzero",
+            ));
+        }
+        self.weight
+            .validate_document_identifier(max_identifier_depth)?;
+        if self.is_ins() && self.origin != self.weight.site {
+            return Err(EngineError::new(
+                ErrorCode::InvalidOperation,
+                "insertion origin must own its ESBT weight",
+            ));
+        }
+        Ok(())
+    }
+
     /// `[tag][origin][seq varint][c varint][weight][utf16?]`
     ///
     /// The weight elides its site whenever it equals `origin` — always true
     /// for insertions — plus its default sequence path and zero sequence
-    /// number (format v2, Extension 2).
-    pub fn encode(&self) -> Vec<u8> {
+    /// number (the compact identifier encoding from Extension 2).
+    #[cfg(test)]
+    pub(crate) fn encode(&self) -> Vec<u8> {
         let mut b = Vec::new();
         b.push(match self.kind {
             OpKind::Ins { .. } => 1,
@@ -71,11 +93,16 @@ impl Op {
         b
     }
 
-    pub fn decode(buf: &[u8]) -> Option<Self> {
+    #[cfg(test)]
+    pub(crate) fn decode(buf: &[u8]) -> Option<Self> {
         Self::decode_with_limits(buf, &ResourceLimits::wire_default()).ok()
     }
 
-    pub fn decode_with_limits(buf: &[u8], limits: &ResourceLimits) -> Result<Self, EngineError> {
+    #[cfg(test)]
+    pub(crate) fn decode_with_limits(
+        buf: &[u8],
+        limits: &ResourceLimits,
+    ) -> Result<Self, EngineError> {
         if buf.len() > limits.max_message_bytes {
             return Err(EngineError::new(
                 ErrorCode::MessageTooLarge,
@@ -91,16 +118,6 @@ impl Op {
         let seq = reader.uvarint()?;
         let counter = reader.uvarint()?;
 
-        // Site zero is reserved for sentinels. Sequence and insertion
-        // counters start at one. Rejecting these values here keeps malformed
-        // operations out of the replica rather than making every caller
-        // rediscover the invariants.
-        if origin == 0 || seq == 0 || counter == 0 {
-            return Err(EngineError::new(
-                ErrorCode::InvalidOperation,
-                "operation identities must be nonzero",
-            ));
-        }
         let weight = read_weight(&mut reader, limits, origin)?;
         let op = match tag {
             1 => {
@@ -121,6 +138,7 @@ impl Op {
                 "operation contains trailing bytes",
             ));
         }
+        op.validate(Some(limits.max_identifier_depth))?;
         Ok(op)
     }
 }

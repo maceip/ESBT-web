@@ -109,12 +109,7 @@ impl Update {
         let mut previous = None;
         for operation in &operations {
             let identity = (operation.origin, operation.seq);
-            if operation.origin == 0 || operation.seq == 0 || operation.counter == 0 {
-                return Err(EngineError::new(
-                    ErrorCode::InvalidOperation,
-                    "update contains a zero operation identity",
-                ));
-            }
+            operation.validate(None)?;
             if previous.is_some_and(|value| value >= identity) {
                 return Err(EngineError::new(
                     ErrorCode::NonCanonicalEncoding,
@@ -138,12 +133,11 @@ impl Update {
         self.operations.len()
     }
 
-    /// Payload encoding used inside the versioned `ESBM` envelope
-    /// (format v3, Extension 2 follow-up).
+    /// Payload encoding used inside the unified `ESBT` Update envelope.
     ///
     /// Every 16-byte site appears once in a sorted dictionary; operations
     /// reference it by varint index and are self-delimiting, so the per-op
-    /// length prefix of earlier formats is gone. Because operations are
+    /// length prefix of the retired codec is gone. Because operations are
     /// canonically sorted by `(origin, seq)`, a typing run's weights are
     /// adjacent, and each sequence path is front-coded against its
     /// predecessor exactly as snapshot atoms are.
@@ -270,6 +264,7 @@ impl Update {
                     ))
                 }
             };
+            operation.validate(Some(limits.max_identifier_depth))?;
             operations.push(operation);
         }
         if !reader.is_finished() {
@@ -327,39 +322,4 @@ pub struct ApplyReceipt {
     /// Exact canonical bytes a durable room should append. `None` means the
     /// update was empty or entirely duplicate and needs no second journal row.
     pub journal_bytes: Option<Vec<u8>>,
-}
-
-impl ApplyReceipt {
-    /// Stable binary receipt returned by the Wasm ABI.
-    ///
-    /// `[version:u16][outcome:u8][visible:u8]`, four operation-ref lists,
-    /// encoded version summary, and optional canonical journal bytes.
-    pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::new();
-        out.extend_from_slice(&1u16.to_le_bytes());
-        out.push(self.outcome as u8);
-        out.push(u8::from(self.visible_changed));
-        for identities in [
-            &self.accepted_operations,
-            &self.applied_operations,
-            &self.buffered_operations,
-            &self.newly_ready_operations,
-        ] {
-            out.extend_from_slice(&(identities.len() as u32).to_le_bytes());
-            for identity in identities {
-                out.extend_from_slice(&identity.origin.to_le_bytes());
-                out.extend_from_slice(&identity.sequence.to_le_bytes());
-            }
-        }
-        let version = self.version.encode();
-        out.extend_from_slice(&(version.len() as u32).to_le_bytes());
-        out.extend_from_slice(&version);
-        if let Some(journal) = &self.journal_bytes {
-            out.extend_from_slice(&(journal.len() as u32).to_le_bytes());
-            out.extend_from_slice(journal);
-        } else {
-            out.extend_from_slice(&0u32.to_le_bytes());
-        }
-        out
-    }
 }

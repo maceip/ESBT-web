@@ -1,13 +1,11 @@
 //! Stable, persistable positions for selections and product-owned metadata.
 
+use crate::clock::Version;
 use crate::codec::{read_weight, write_weight, Reader};
 use crate::error::{EngineError, ErrorCode};
 use crate::limits::ResourceLimits;
 use crate::replica::Replica;
 use crate::weight::Weight;
-
-const ANCHOR_MAGIC: &[u8; 4] = b"ESBA";
-const ANCHOR_FORMAT_VERSION: u16 = 2;
 
 /// Anchors are self-contained, so their weights carry an inline site.
 const NO_SITE_CONTEXT: crate::weight::SiteId = 0;
@@ -108,9 +106,11 @@ impl Anchor {
     }
 
     pub fn encode(&self) -> Vec<u8> {
+        crate::wire::Artifact::Anchor(self.clone()).encode()
+    }
+
+    pub(crate) fn encode_payload(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        out.extend_from_slice(ANCHOR_MAGIC);
-        out.extend_from_slice(&ANCHOR_FORMAT_VERSION.to_le_bytes());
         out.push(self.affinity as u8);
         match &self.target {
             AnchorTarget::Start => out.push(1),
@@ -129,6 +129,19 @@ impl Anchor {
     }
 
     pub fn decode_with_limits(bytes: &[u8], limits: &ResourceLimits) -> Result<Self, EngineError> {
+        match crate::wire::Artifact::decode_with_limits(bytes, limits)? {
+            crate::wire::Artifact::Anchor(anchor) => Ok(anchor),
+            _ => Err(EngineError::new(
+                ErrorCode::InvalidAnchor,
+                "expected an ESBT anchor artifact",
+            )),
+        }
+    }
+
+    pub(crate) fn decode_payload_with_limits(
+        bytes: &[u8],
+        limits: &ResourceLimits,
+    ) -> Result<Self, EngineError> {
         if bytes.len() > limits.max_message_bytes {
             return Err(EngineError::new(
                 ErrorCode::MessageTooLarge,
@@ -136,18 +149,6 @@ impl Anchor {
             ));
         }
         let mut reader = Reader::new(bytes);
-        if reader.take(ANCHOR_MAGIC.len())? != ANCHOR_MAGIC {
-            return Err(EngineError::new(
-                ErrorCode::InvalidAnchor,
-                "invalid anchor magic",
-            ));
-        }
-        if reader.u16()? != ANCHOR_FORMAT_VERSION {
-            return Err(EngineError::new(
-                ErrorCode::UnsupportedFormatVersion,
-                "unsupported anchor format version",
-            ));
-        }
         let affinity = match reader.u8()? {
             1 => Affinity::Before,
             2 => Affinity::After,
@@ -196,6 +197,76 @@ impl Anchor {
             (AnchorTarget::Item { .. }, _) => {}
         }
         Ok(Self { target, affinity })
+    }
+}
+
+/// A stable position plus the exact causal frontier at which it was captured.
+/// Consumers can distinguish "not integrated yet" from an anchor that has
+/// legitimately collapsed after its target was deleted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CausalPosition {
+    pub version: Version,
+    pub anchor: Anchor,
+}
+
+impl CausalPosition {
+    pub fn new(version: Version, anchor: Anchor) -> Self {
+        Self { version, anchor }
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        crate::wire::Artifact::CausalPosition(self.clone()).encode()
+    }
+
+    pub(crate) fn encode_payload(&self) -> Vec<u8> {
+        let version = self.version.encode_payload();
+        let anchor = self.anchor.encode_payload();
+        let mut out = Vec::with_capacity(8 + version.len() + anchor.len());
+        out.extend_from_slice(
+            &u32::try_from(version.len())
+                .expect("causal-position version exceeds u32")
+                .to_le_bytes(),
+        );
+        out.extend_from_slice(&version);
+        out.extend_from_slice(
+            &u32::try_from(anchor.len())
+                .expect("causal-position anchor exceeds u32")
+                .to_le_bytes(),
+        );
+        out.extend_from_slice(&anchor);
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        Self::decode_with_limits(bytes, &ResourceLimits::wire_default()).ok()
+    }
+
+    pub fn decode_with_limits(bytes: &[u8], limits: &ResourceLimits) -> Result<Self, EngineError> {
+        match crate::wire::Artifact::decode_with_limits(bytes, limits)? {
+            crate::wire::Artifact::CausalPosition(position) => Ok(position),
+            _ => Err(EngineError::new(
+                ErrorCode::InvalidAnchor,
+                "expected an ESBT causal-position artifact",
+            )),
+        }
+    }
+
+    pub(crate) fn decode_payload_with_limits(
+        bytes: &[u8],
+        limits: &ResourceLimits,
+    ) -> Result<Self, EngineError> {
+        let mut reader = Reader::new(bytes);
+        let version_length = reader.u32()? as usize;
+        let version = Version::decode_payload_with_limits(reader.take(version_length)?, limits)?;
+        let anchor_length = reader.u32()? as usize;
+        let anchor = Anchor::decode_payload_with_limits(reader.take(anchor_length)?, limits)?;
+        if !reader.is_finished() {
+            return Err(EngineError::new(
+                ErrorCode::NonCanonicalEncoding,
+                "causal position contains trailing bytes",
+            ));
+        }
+        Ok(Self { version, anchor })
     }
 }
 
@@ -252,5 +323,13 @@ mod tests {
         remote.receive(b);
         assert!(matches!(local.text().as_str(), "abx" | "xab"));
         assert_eq!(local.text(), remote.text());
+    }
+
+    #[test]
+    fn causal_position_roundtrips_under_the_shared_envelope() {
+        let mut version = Version::default();
+        version.note(7, 1);
+        let position = CausalPosition::new(version, Anchor::start());
+        assert_eq!(CausalPosition::decode(&position.encode()), Some(position));
     }
 }

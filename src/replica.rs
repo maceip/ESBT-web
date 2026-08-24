@@ -1,6 +1,6 @@
 //! Algorithm 3 — per-replica control, plus join snapshot and op log.
 
-use crate::allocator::{AdaptiveDmaxConfig, Allocator};
+use crate::allocator::{AdaptiveDmaxConfig, Allocator, DMAX_HARD_CEILING};
 use crate::clock::{SiteReceiptCheckpoint, Version};
 use crate::error::{EngineError, ErrorCode};
 use crate::newseq::AllocationStrategy;
@@ -34,6 +34,50 @@ impl Default for ReplicaConfig {
             adaptive_dmax: None,
             strategy: AllocationStrategy::Midpoint,
         }
+    }
+}
+
+impl ReplicaConfig {
+    pub fn validate(&self) -> Result<(), EngineError> {
+        if !(2..=DMAX_HARD_CEILING).contains(&self.dmax) {
+            return Err(EngineError::new(
+                ErrorCode::InvalidOperation,
+                "Dmax is outside the supported range",
+            ));
+        }
+        if self.base < 2 || self.depth == 0 {
+            return Err(EngineError::new(
+                ErrorCode::InvalidOperation,
+                "allocator base and depth must be nonzero and in range",
+            ));
+        }
+        let boundary = match self.strategy {
+            AllocationStrategy::Midpoint => None,
+            AllocationStrategy::BoundaryLow(value)
+            | AllocationStrategy::BoundaryHigh(value)
+            | AllocationStrategy::AlternatingByDepth(value) => Some(value),
+        };
+        if boundary == Some(0) {
+            return Err(EngineError::new(
+                ErrorCode::InvalidOperation,
+                "allocation strategy boundary must be nonzero",
+            ));
+        }
+        if let Some(adaptive) = self.adaptive_dmax {
+            if !(2..=DMAX_HARD_CEILING).contains(&adaptive.floor)
+                || adaptive.ceiling < adaptive.floor
+                || adaptive.ceiling > DMAX_HARD_CEILING
+                || adaptive.window == 0
+                || self.dmax < adaptive.floor
+                || self.dmax > adaptive.ceiling
+            {
+                return Err(EngineError::new(
+                    ErrorCode::InvalidOperation,
+                    "adaptive Dmax configuration is outside the supported range",
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -488,7 +532,7 @@ impl Replica {
     pub fn local_insert(&mut self, index: usize, unit: u16) -> Op {
         let attempts = self.doc.len().saturating_add(4_096);
         self.try_local_insert(index, unit, attempts)
-            .expect("legacy Replica::local_insert allocation failed")
+            .expect("Replica::local_insert allocation failed")
     }
 
     /// Typed production insertion. `Document` wraps this in its mutation
@@ -687,13 +731,21 @@ impl Replica {
     }
 
     pub fn receive(&mut self, op: Op) {
+        let _ = self.try_receive(op);
+    }
+
+    /// Typed native receive path. Invalid operations are rejected before the
+    /// replica mutates; `receive` remains a convenience for simulation code
+    /// that intentionally ignores duplicates and invalid foreign input.
+    pub fn try_receive(&mut self, op: Op) -> Result<bool, EngineError> {
         if op.origin == self.site {
-            return;
+            return Ok(false);
         }
-        let _ = self.import_operation(op);
+        self.import_operation(op)
     }
 
     pub(crate) fn import_operation(&mut self, op: Op) -> Result<bool, EngineError> {
+        op.validate(None)?;
         if let Some(existing) = self.log.get(&(op.origin, op.seq)) {
             if existing == &op {
                 return Ok(false);
@@ -710,26 +762,13 @@ impl Replica {
         if self.version.contains(op.origin, op.seq) {
             return Ok(false);
         }
-        if op.origin == 0 || op.seq == 0 || op.counter == 0 || op.weight.site == Weight::EMPTY_SITE
+        if matches!(op.kind, OpKind::Ins { .. })
+            && self.insertion_version.contains(op.weight.site, op.counter)
         {
             return Err(EngineError::new(
-                ErrorCode::InvalidOperation,
-                "operation contains a zero identity",
+                ErrorCode::OperationIdentityConflict,
+                "insertion counter is already bound to an earlier insertion",
             ));
-        }
-        if matches!(op.kind, OpKind::Ins { .. }) {
-            if op.origin != op.weight.site {
-                return Err(EngineError::new(
-                    ErrorCode::InvalidOperation,
-                    "insertion origin does not own its ESBT weight",
-                ));
-            }
-            if self.insertion_version.contains(op.weight.site, op.counter) {
-                return Err(EngineError::new(
-                    ErrorCode::OperationIdentityConflict,
-                    "insertion counter is already bound to an earlier insertion",
-                ));
-            }
         }
         let _ = self.admit_validated_operation(op);
         Ok(true)
@@ -1104,6 +1143,41 @@ mod tests {
             depth: 3,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn typed_native_receive_reuses_wire_weight_invariants_before_mutation() {
+        let mut replica = Replica::new(1, cfg());
+        let unreduced = Op::ins(
+            Weight::new(crate::fraction::Fraction { p: 2, q: 4 }, 0, vec![0], 2),
+            b'x' as u16,
+            1,
+            2,
+            1,
+        );
+        let error = replica
+            .try_receive(unreduced)
+            .expect_err("unreduced fraction");
+        assert_eq!(error.code, ErrorCode::InvalidOperation);
+        assert_eq!(replica.len(), 0);
+        assert!(replica.log.is_empty());
+
+        let empty_path = Op::ins(
+            Weight {
+                f: crate::fraction::Fraction::new(1, 2),
+                sn: 0,
+                sc: Vec::new(),
+                site: 2,
+            },
+            b'x' as u16,
+            1,
+            2,
+            1,
+        );
+        let error = replica.try_receive(empty_path).expect_err("empty path");
+        assert_eq!(error.code, ErrorCode::InvalidOperation);
+        assert_eq!(replica.len(), 0);
+        assert!(replica.log.is_empty());
     }
 
     #[test]

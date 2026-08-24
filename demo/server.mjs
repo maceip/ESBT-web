@@ -10,9 +10,6 @@ import { fileURLToPath } from "node:url";
 import { WebSocketServer } from "ws";
 
 const root = path.resolve(fileURLToPath(new URL("../web", import.meta.url)));
-const wasmArtifact = path.resolve(
-  fileURLToPath(new URL("../target/wasm32-unknown-unknown/release/esbt.wasm", import.meta.url)),
-);
 const port = Number(process.env.PORT || 8080);
 const rooms = new Map();
 
@@ -28,8 +25,8 @@ const server = http.createServer((req, res) => {
   const u = new URL(req.url, "http://localhost");
   let p = decodeURIComponent(u.pathname);
   if (p === "/") p = "/index.html";
-  const file = p === "/esbt.wasm" ? wasmArtifact : path.normalize(path.join(root, p));
-  if (file !== wasmArtifact && !file.startsWith(root)) {
+  const file = path.normalize(path.join(root, p));
+  if (file !== root && !file.startsWith(`${root}${path.sep}`)) {
     res.writeHead(403);
     res.end();
     return;

@@ -1,16 +1,17 @@
 //! Stateful production API layered over the paper-level `Replica`.
 
-use crate::anchor::{Affinity, Anchor};
+use crate::anchor::{Affinity, Anchor, CausalPosition};
 use crate::clock::Version;
 use crate::error::{EngineError, ErrorCode};
 use crate::limits::ResourceLimits;
 use crate::op::{Op, OpKind};
 use crate::replica::{LocalTransactionCheckpoint, Replica, ReplicaConfig, SnapshotMergeError};
-use crate::snapshot::{FullSnapshot, Message, Snapshot};
+use crate::snapshot::{FullSnapshot, Snapshot};
 use crate::update::{
     push_visible_edit, ApplyOutcome, ApplyReceipt, OperationRef, Update, VisibleEdit,
 };
 use crate::weight::{SiteId, Weight};
+use crate::wire::Artifact;
 use std::collections::{BTreeSet, HashMap};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -18,7 +19,7 @@ pub struct LocalUpdate {
     /// Canonical decoded value, useful to native callers that do not need to
     /// parse their own journal bytes.
     pub update: Update,
-    /// Exact retry-safe `ESBM` bytes emitted once after the local state commits.
+    /// Exact retry-safe ESBT Update artifact emitted after local state commits.
     pub canonical_bytes: Vec<u8>,
     pub visible_changed: bool,
     pub visible_edits: Vec<VisibleEdit>,
@@ -160,16 +161,8 @@ impl Document {
                 "site zero is reserved for sentinels",
             ));
         }
-        if limits.max_identifier_depth == 0
-            || limits.max_operations_per_update == 0
-            || limits.max_message_bytes < 16
-            || limits.max_allocation_attempts == 0
-        {
-            return Err(EngineError::new(
-                ErrorCode::InvalidOperation,
-                "resource limits disable a required engine primitive",
-            ));
-        }
+        replica_config.validate()?;
+        limits.validate()?;
         Ok(Self {
             replica: Replica::new(site, replica_config),
             limits,
@@ -253,6 +246,28 @@ impl Document {
         anchor.resolve(&self.replica)
     }
 
+    /// Capture a stable anchor together with the exact receipt frontier that
+    /// must be integrated before another replica may resolve it.
+    pub fn capture_causal_position(
+        &self,
+        index: usize,
+        affinity: Affinity,
+    ) -> Result<CausalPosition, EngineError> {
+        Ok(CausalPosition::new(
+            self.version(),
+            self.anchor(index, affinity)?,
+        ))
+    }
+
+    /// `None` means the local replica has not integrated the captured causal
+    /// frontier yet. Once covered, anchor collapse semantics are deterministic.
+    pub fn resolve_causal_position(&self, position: &CausalPosition) -> Option<usize> {
+        self.replica
+            .version
+            .covers(&position.version)
+            .then(|| self.resolve_anchor(&position.anchor))
+    }
+
     pub fn begin_transaction(&mut self, undo_group: Option<u64>) -> Result<(), EngineError> {
         self.begin_transaction_mode(undo_group, TransactionMode::Normal)
     }
@@ -329,7 +344,7 @@ impl Document {
                 return Err(error);
             }
         };
-        let canonical_bytes = Message::Update(update.clone()).encode();
+        let canonical_bytes = Artifact::Update(update.clone()).encode();
         if canonical_bytes.len() > self.limits.max_message_bytes {
             self.rollback_transaction(transaction);
             return Err(EngineError::new(
@@ -360,6 +375,15 @@ impl Document {
             Some(EngineError::new(
                 ErrorCode::TooManyDeferredDeletes,
                 "committing local edits would exceed deferred deletions",
+            ))
+        } else if projection
+            .visible_units
+            .checked_add(projection.deferred_deletes)
+            .is_none_or(|items| items > self.limits.max_snapshot_items)
+        {
+            Some(EngineError::new(
+                ErrorCode::TooManySnapshotItems,
+                "committing local edits would exceed checkpoint capacity",
             ))
         } else {
             None
@@ -963,9 +987,9 @@ impl Document {
                 "cannot import while a local transaction is active",
             ));
         }
-        let message = Message::decode_with_limits(bytes, &self.limits)?;
+        let message = Artifact::decode_with_limits(bytes, &self.limits)?;
         let update = match message {
-            Message::Update(update) => update,
+            Artifact::Update(update) => update,
             _ => {
                 return Err(EngineError::new(
                     ErrorCode::MalformedEncoding,
@@ -1088,6 +1112,16 @@ impl Document {
                 "update would exceed the deferred deletion limit",
             ));
         }
+        if projection
+            .visible_units
+            .checked_add(projection.deferred_deletes)
+            .is_none_or(|items| items > self.limits.max_snapshot_items)
+        {
+            return Err(EngineError::new(
+                ErrorCode::TooManySnapshotItems,
+                "update would create more state than a checkpoint can contain",
+            ));
+        }
 
         let accepted_operations: Vec<_> = admitted
             .iter()
@@ -1100,7 +1134,7 @@ impl Document {
                 .iter()
                 .map(|operation| (*operation).clone())
                 .collect();
-            let bytes = Message::Update(Update::new(operations)?).encode();
+            let bytes = Artifact::Update(Update::new(operations)?).encode();
             if bytes.len() > self.limits.max_message_bytes {
                 return Err(EngineError::new(
                     ErrorCode::MessageTooLarge,
@@ -1182,7 +1216,7 @@ impl Document {
                 "compact snapshot requires a contiguous version and empty pending queue",
             ));
         }
-        let bytes = Message::Snapshot(self.replica.snapshot()).encode();
+        let bytes = Artifact::CompactSnapshot(self.replica.snapshot()).encode();
         if bytes.len() > self.limits.max_message_bytes {
             return Err(EngineError::new(
                 ErrorCode::MessageTooLarge,
@@ -1216,7 +1250,7 @@ impl Document {
             retained_operations,
             pending_operations,
         )?;
-        let bytes = Message::FullSnapshot(snapshot).encode();
+        let bytes = Artifact::FullSnapshot(snapshot).encode();
         if bytes.len() > self.limits.max_message_bytes {
             return Err(EngineError::new(
                 ErrorCode::MessageTooLarge,
@@ -1233,15 +1267,15 @@ impl Document {
                 "cannot import a snapshot inside a local transaction",
             ));
         }
-        let message = Message::decode_with_limits(bytes, &self.limits)?;
+        let message = Artifact::decode_with_limits(bytes, &self.limits)?;
         let mut staged = self.clone();
         let before_units = staged.utf16_units();
         let (kind, undo) = match message {
-            Message::Snapshot(snapshot) => {
+            Artifact::CompactSnapshot(snapshot) => {
                 let undo = staged.merge_compact_snapshot(&snapshot)?;
                 (SnapshotKind::Compact, undo)
             }
-            Message::FullSnapshot(snapshot) => staged.merge_full_snapshot(&snapshot)?,
+            Artifact::FullSnapshot(snapshot) => staged.merge_full_snapshot(&snapshot)?,
             _ => {
                 return Err(EngineError::new(
                     ErrorCode::MalformedEncoding,
@@ -1413,7 +1447,7 @@ impl Document {
             ));
         }
         let update = Update::new(self.replica.ops_missing_from(remote))?;
-        let bytes = Message::Update(update).encode();
+        let bytes = Artifact::Update(update).encode();
         if bytes.len() > self.limits.max_message_bytes {
             return Err(EngineError::new(
                 ErrorCode::MessageTooLarge,
@@ -1424,36 +1458,7 @@ impl Document {
     }
 
     fn validate_operation(&self, operation: &Op) -> Result<(), EngineError> {
-        if operation.origin == 0
-            || operation.seq == 0
-            || operation.counter == 0
-            || operation.weight.site == Weight::EMPTY_SITE
-        {
-            return Err(EngineError::new(
-                ErrorCode::InvalidOperation,
-                "operation contains a zero identity",
-            ));
-        }
-        if operation.weight.sc.is_empty() {
-            return Err(EngineError::new(
-                ErrorCode::InvalidOperation,
-                "operation identifier path is empty",
-            ));
-        }
-        if operation.weight.sc.len() > self.limits.max_identifier_depth {
-            return Err(EngineError::new(
-                ErrorCode::IdentifierTooDeep,
-                "operation identifier exceeds the depth limit",
-            ));
-        }
-        if matches!(operation.kind, OpKind::Ins { .. }) && operation.origin != operation.weight.site
-        {
-            return Err(EngineError::new(
-                ErrorCode::InvalidOperation,
-                "insertion origin must own its ESBT weight",
-            ));
-        }
-        Ok(())
+        operation.validate(Some(self.limits.max_identifier_depth))
     }
 
     fn validate_state(&self) -> Result<(), EngineError> {
@@ -1477,6 +1482,16 @@ impl Document {
             return Err(EngineError::new(
                 ErrorCode::TooManyDeferredDeletes,
                 "delete log exceeds the limit",
+            ));
+        }
+        if replica
+            .len()
+            .checked_add(replica.delete_log.len())
+            .is_none_or(|items| items > self.limits.max_snapshot_items)
+        {
+            return Err(EngineError::new(
+                ErrorCode::TooManySnapshotItems,
+                "materialized state exceeds checkpoint capacity",
             ));
         }
         if replica.log.len() > self.limits.max_retained_operations {
@@ -1513,20 +1528,10 @@ impl Document {
             ));
         }
         for (weight, _, _) in replica.doc.atoms() {
-            if weight.sc.len() > self.limits.max_identifier_depth {
-                return Err(EngineError::new(
-                    ErrorCode::IdentifierTooDeep,
-                    "live identifier exceeds the depth limit",
-                ));
-            }
+            weight.validate_document_identifier(Some(self.limits.max_identifier_depth))?;
         }
         for (weight, _) in &replica.delete_log {
-            if weight.sc.len() > self.limits.max_identifier_depth {
-                return Err(EngineError::new(
-                    ErrorCode::IdentifierTooDeep,
-                    "deleted identifier exceeds the depth limit",
-                ));
-            }
+            weight.validate_document_identifier(Some(self.limits.max_identifier_depth))?;
         }
         Ok(())
     }
@@ -1628,12 +1633,12 @@ mod tests {
         target.apply_bytes(&bytes).expect("first apply");
         let before = target.text();
 
-        let mut conflicting = match Message::decode(&bytes).expect("decode") {
-            Message::Update(update) => update.operations()[0].clone(),
+        let mut conflicting = match Artifact::decode(&bytes).expect("decode") {
+            Artifact::Update(update) => update.operations()[0].clone(),
             _ => unreachable!(),
         };
         conflicting.kind = OpKind::Ins { unit: b'Z' as u16 };
-        let conflict = Message::Update(Update::new(vec![conflicting]).expect("update")).encode();
+        let conflict = Artifact::Update(Update::new(vec![conflicting]).expect("update")).encode();
         assert_eq!(
             target.apply_bytes(&conflict).expect_err("conflict").code,
             ErrorCode::OperationIdentityConflict
@@ -1712,6 +1717,49 @@ mod tests {
         assert_eq!(error.code, ErrorCode::DocumentTooLarge);
         assert!(document.is_empty());
         assert_eq!(document.replica().log.len(), 0);
+    }
+
+    #[test]
+    fn combined_live_and_deferred_state_cannot_exceed_checkpoint_capacity() {
+        let mut second = Document::with_defaults(2).expect("second source");
+        let independent = second
+            .insert(0, "B", None)
+            .expect("independent insert")
+            .expect("independent update");
+
+        let limits = ResourceLimits {
+            max_snapshot_items: 1,
+            max_document_units: 1,
+            max_deferred_deletes: 1,
+            ..ResourceLimits::default()
+        };
+        let mut target = Document::new(3, ReplicaConfig::default(), limits).expect("target");
+        let deferred_weight = Weight::new(crate::fraction::Fraction::new(1, 2), 0, vec![0], 1);
+        let deferred = Snapshot {
+            delete_log: vec![(deferred_weight.clone(), 1)],
+            ..Snapshot::default()
+        };
+        let deferred = FullSnapshot::new(deferred, Version::default(), Vec::new(), Vec::new())
+            .expect("deferred full snapshot");
+        target
+            .apply_snapshot_bytes(&Artifact::FullSnapshot(deferred).encode())
+            .expect("deferred delete fits alone");
+        let error = target
+            .apply_bytes(&independent.canonical_bytes)
+            .expect_err("live plus deferred exceeds snapshot limit");
+        assert_eq!(error.code, ErrorCode::TooManySnapshotItems);
+        assert!(target.is_empty());
+        assert_eq!(target.pending_len(), 0);
+
+        let inserted = Artifact::Update(
+            Update::new(vec![Op::ins(deferred_weight, b'A' as u16, 1, 1, 1)])
+                .expect("target insertion update"),
+        )
+        .encode();
+        target
+            .apply_bytes(&inserted)
+            .expect("target insertion resolves the deferred delete");
+        assert!(target.is_empty());
     }
 
     #[test]

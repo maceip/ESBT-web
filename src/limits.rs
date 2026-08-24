@@ -1,5 +1,7 @@
 //! Central resource policy for local edits and untrusted wire input.
 
+use crate::{EngineError, ErrorCode};
+
 /// Limits are deliberately carried by a document instance so a native room
 /// and a browser can choose lower ceilings without changing the wire format.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -50,9 +52,40 @@ impl Default for ResourceLimits {
 }
 
 impl ResourceLimits {
-    /// Conservative limits used by the compatibility decoders that do not
-    /// receive a document-specific policy.
+    /// Conservative limits used by convenience decoders that do not receive
+    /// a document-specific policy.
     pub fn wire_default() -> Self {
         Self::default()
+    }
+
+    /// Reject incoherent policy before a document can create state that it
+    /// cannot later encode, checkpoint, or replay.
+    pub fn validate(&self) -> Result<(), EngineError> {
+        if self.max_message_bytes < crate::wire::WIRE_HEADER_BYTES
+            || self.max_operations_per_update == 0
+            || self.max_identifier_depth == 0
+            || self.max_version_sites == 0
+            || self.max_snapshot_items == 0
+            || self.max_allocation_attempts == 0
+            || self.max_retained_operations == 0
+        {
+            return Err(EngineError::new(
+                ErrorCode::InvalidOperation,
+                "resource limits disable a required engine primitive",
+            ));
+        }
+        if self.max_snapshot_items < self.max_document_units {
+            return Err(EngineError::new(
+                ErrorCode::InvalidOperation,
+                "snapshot item limit must cover the document unit limit",
+            ));
+        }
+        if self.max_retained_operations < self.max_operations_per_update {
+            return Err(EngineError::new(
+                ErrorCode::InvalidOperation,
+                "retained operation limit must cover one update",
+            ));
+        }
+        Ok(())
     }
 }

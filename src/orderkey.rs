@@ -5,7 +5,7 @@
 //! expose a fractional-index / position-string slot (Figma-style ordered
 //! sequences, Loro's movable-tree sibling order, sortable database keys).
 //! That slot accepts any generator of totally ordered keys with a
-//! mint-between operation. This module makes ESBT that generator: a `Weight`
+//! mint-between operation. This experimental native module makes ESBT such a generator: a `Weight`
 //! is encoded to a byte string whose plain `memcmp` order equals
 //! Definition 2's weight order, and `key_between` mints a fresh key strictly
 //! inside any gap using the full ESBT allocator (bounded fractions, `sn`
@@ -267,9 +267,10 @@ pub fn weight_from_order_key(bytes: &[u8], limits: &ResourceLimits) -> Result<We
 
 /// Mint a key strictly between two existing keys (`None` = document edge).
 ///
-/// This is the framework-facing plug: any host that stores sortable byte
-/// strings can call this instead of a fractional-index generator and gets
-/// ESBT's bounded identifier growth in exchange.
+/// This is an experimental framework-facing plug, not a WIT or document-wire
+/// surface. A host with a sortable-byte seam can call it instead of a
+/// fractional-index generator. Fractions remain bounded; complete keys remain
+/// subject to the caller's explicit identifier-depth resource limit.
 pub fn key_between(
     allocator: &mut Allocator,
     left: Option<&[u8]>,

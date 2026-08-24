@@ -5,15 +5,18 @@
   "scripts": {
     "demo": "node demo/server.mjs",
     "showcase": "node demo/showcase.mjs",
-    "build:wasm": "bash tools/build-wasm.sh",
-    "generate:abi": "node tools/wasm-abi.mjs",
-    "check:abi": "node tools/wasm-abi.mjs --check",
-    "test:wasm": "npm run build:wasm && node tools/wasm-abi.mjs --check --verify-wasm web/esbt.wasm && node demo/wasm-smoke.mjs"
+    "build:component": "bash tools/build-component.sh",
+    "check:component": "node tools/verify-component.mjs",
+    "test:mesh": "node --test tests/mesh.test.mjs",
+    "test:component": "npm run build:component && npm run check:component && npm run test:mesh && node demo/component-smoke.mjs && node demo/component-large-edit.mjs"
   },
   "dependencies": {
+    "agent-browser": "^0.8.0",
     "playwright": "^1.55.0",
-    "puppeteer-core": "^24.0.0",
-    "ws": "^8.18.0",
-    "agent-browser": "^0.8.0"
+    "puppeteer-core": "^25.8.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@bytecodealliance/jco-transpile": "0.12.1"
   }
 }

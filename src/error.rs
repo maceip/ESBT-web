@@ -4,8 +4,8 @@ use core::fmt;
 
 /// Machine-readable error code shared by native Rust and the Wasm adapter.
 ///
-/// Values are explicit because the C ABI returns them to JavaScript. New codes
-/// may be appended, but existing numeric values are part of the public ABI.
+/// Values are explicit because WIT lifts them into the typed `engine-error`
+/// record and products may persist them in diagnostics.
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ErrorCode {

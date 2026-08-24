@@ -18,7 +18,7 @@
 //! journal bytes, compact snapshot bytes, and sequence-path depth stats.
 
 use esbt::replica::{Replica, ReplicaConfig};
-use esbt::{AdaptiveDmaxConfig, AllocationStrategy};
+use esbt::{AdaptiveDmaxConfig, AllocationStrategy, Artifact, Op, Update};
 use std::time::Instant;
 
 #[derive(Clone, Debug)]
@@ -246,11 +246,11 @@ fn replay(name: &'static str, config: ReplicaConfig, edits: &[Edit]) -> Outcome 
     for edit in edits {
         match *edit {
             Edit::Insert { position, unit } => {
-                journal_bytes += replica.local_insert(position, unit).encode().len();
+                journal_bytes += encoded_update_len(replica.local_insert(position, unit));
             }
             Edit::Delete { position, count } => {
                 for op in replica.local_delete_range(position, count) {
-                    journal_bytes += op.encode().len();
+                    journal_bytes += encoded_update_len(op);
                 }
             }
         }
@@ -272,6 +272,12 @@ fn replay(name: &'static str, config: ReplicaConfig, edits: &[Edit]) -> Outcome 
         max_path_depth: depths.iter().copied().max().unwrap_or(0),
         final_dmax: replica.alloc.current_dmax(),
     }
+}
+
+fn encoded_update_len(operation: Op) -> usize {
+    Artifact::Update(Update::new(vec![operation]).expect("local operation"))
+        .encode()
+        .len()
 }
 
 fn run_workload(label: &str, edits: &[Edit]) {

@@ -1,10 +1,9 @@
-//! Small exact reader and the canonical ESBT weight codec shared by wire
-//! types (engine format version 2).
+//! Small exact reader and the canonical ESBT weight codec shared by artifacts.
 //!
 //! Extension 2 (paper §10): the sequence path and its neighbors are the only
-//! variable-length identifier components, and format v1 spent fixed-width
-//! fields on all of them. Version 2 removes only redundancy the engine can
-//! prove and re-verify at decode time:
+//! variable-length identifier components. The retired prototype spent
+//! fixed-width fields on all of them. This codec removes only redundancy the
+//! engine can prove and re-verify at decode time:
 //!
 //! - the default path `sc = [0]` is implicit (the paper's own §8.3.1 remark);
 //! - `sn = 0` is implicit;
@@ -25,6 +24,7 @@ use crate::limits::ResourceLimits;
 use crate::weight::{SiteId, Weight};
 
 /// Minimum encoded weight: flags + p + q with everything else implicit.
+#[cfg(test)]
 pub(crate) const MIN_WEIGHT_BYTES: usize = 3;
 
 const FLAG_SN_PRESENT: u8 = 1 << 0;
@@ -386,7 +386,9 @@ pub(crate) fn read_weight_parts(
         }
     };
 
-    Ok(Weight::new(fraction, sn, sc, site))
+    let weight = Weight::new(fraction, sn, sc, site);
+    weight.validate_document_identifier(Some(limits.max_identifier_depth))?;
+    Ok(weight)
 }
 
 fn check_path_budget(
@@ -423,14 +425,7 @@ pub(crate) fn read_weight(
     limits: &ResourceLimits,
     origin: SiteId,
 ) -> Result<Weight, EngineError> {
-    let weight = read_weight_parts(reader, limits, SiteContext::Origin(origin), None)?;
-    if weight.site == Weight::EMPTY_SITE {
-        return Err(EngineError::new(
-            ErrorCode::InvalidOperation,
-            "document weights require a nonzero site",
-        ));
-    }
-    Ok(weight)
+    read_weight_parts(reader, limits, SiteContext::Origin(origin), None)
 }
 
 /// Encoded size of a self-contained weight, used as the identifier-cost

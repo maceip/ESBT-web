@@ -1,9 +1,10 @@
-/** Production browser owner for the Rust `Document` Wasm API. */
+/** High-level browser owner for the WIT-generated ESBT component. */
 
-import { checkedEsbtExports } from "./esbt-abi.generated.js";
+import { instantiate } from "./generated/esbt.js";
 
-const textDecoder = new TextDecoder();
-const MAX_ABI_BYTES = 64 * 1024 * 1024;
+const DISPOSE = Symbol.dispose ?? Symbol.for("dispose");
+const U64_MAX = 0xffff_ffff_ffff_ffffn;
+const U128_MAX = (1n << 128n) - 1n;
 
 export class EsbtError extends Error {
   constructor(code, message) {
@@ -13,167 +14,114 @@ export class EsbtError extends Error {
   }
 }
 
-export class EsbtRuntime {
-  constructor(exports) {
-    this.exports = exports;
-  }
-
-  static async load(url = "./esbt.wasm") {
-    const response = await fetch(url);
-    if (!response.ok) throw new Error(`esbt: failed to fetch Wasm (${response.status})`);
-    const fallback = response.clone();
-    if (typeof WebAssembly.instantiateStreaming === "function") {
-      try {
-        const { module, instance } = await WebAssembly.instantiateStreaming(response, { env: {} });
-        return new EsbtRuntime(checkedEsbtExports(module, instance.exports));
-      } catch {
-        // Development servers sometimes omit application/wasm.
-      }
+function callComponent(callback) {
+  try {
+    return callback();
+  } catch (error) {
+    const payload = error?.payload;
+    if (payload && Number.isInteger(payload.code) && typeof payload.message === "string") {
+      throw new EsbtError(payload.code, payload.message);
     }
-    const { module, instance } = await WebAssembly.instantiate(await fallback.arrayBuffer(), { env: {} });
-    return new EsbtRuntime(checkedEsbtExports(module, instance.exports));
+    throw error;
   }
+}
 
-  memory() {
-    return new Uint8Array(this.exports.memory.buffer);
+async function compileResponse(response, url) {
+  if (!response.ok) {
+    throw new Error(`esbt: failed to fetch ${url} (${response.status})`);
   }
-
-  last() {
-    const length = this.exports.esbt_last_len();
-    const pointer = this.exports.esbt_last_ptr();
-    return this.memory().slice(pointer, pointer + length);
-  }
-
-  check(result) {
-    if (result >= 0) return result;
-    const code = this.exports.esbt_doc_last_error_code() >>> 0;
-    throw new EsbtError(code, textDecoder.decode(this.last()) || `esbt error ${code}`);
-  }
-
-  withBytes(bytes, callback) {
-    const input = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
-    if (input.length > MAX_ABI_BYTES) {
-      throw new EsbtError(7, "esbt: input exceeds the Wasm message limit");
-    }
-    if (input.length === 0) return callback(0, 0);
-    const pointer = this.exports.esbt_malloc(input.length);
-    if (!pointer) throw new EsbtError(7, "esbt: Wasm input allocation failed");
+  if (typeof WebAssembly.compileStreaming === "function") {
     try {
-      this.memory().set(input, pointer);
-      return callback(pointer, input.length);
-    } finally {
-      this.exports.esbt_free(pointer, input.length);
+      return await WebAssembly.compileStreaming(Promise.resolve(response.clone()));
+    } catch {
+      // A development server may omit application/wasm. The buffered path is
+      // still standards-compatible in Chromium, Firefox, and WebKit.
     }
   }
-
-  withTwoBuffers(first, second, callback) {
-    return this.withBytes(first, (firstPointer, firstLength) =>
-      this.withBytes(second, (secondPointer, secondLength) =>
-        callback(firstPointer, firstLength, secondPointer, secondLength),
-      ),
-    );
-  }
+  return WebAssembly.compile(await response.arrayBuffer());
 }
 
-// Canonical LEB128, matching the engine codec (non-minimal forms rejected).
-function pushVarint(bytes, value) {
-  if (!Number.isSafeInteger(value) || value < 0) {
-    throw new EsbtError(4, "esbt: config values must be non-negative safe integers");
+export class EsbtRuntime {
+  constructor(engine) {
+    this.engine = engine;
   }
-  do {
-    const group = value % 128;
-    value = Math.floor(value / 128);
-    bytes.push(value > 0 ? group | 0x80 : group);
-  } while (value > 0);
-}
 
-const STRATEGY_TAGS = {
-  midpoint: 0,
-  "boundary-low": 1,
-  "boundary-high": 2,
-  "alternating-by-depth": 3,
-};
-
-const LIMIT_FIELDS = [
-  "maxMessageBytes",
-  "maxOperationsPerUpdate",
-  "maxIdentifierDepth",
-  "maxVersionSites",
-  "maxSparseReceipts",
-  "maxSnapshotItems",
-  "maxPendingOperations",
-  "maxDeferredDeletes",
-  "maxDocumentUnits",
-  "maxAllocationAttempts",
-  "maxRetainedOperations",
-  "maxUndoTransactions",
-];
-
-const DEFAULT_LIMITS = {
-  maxMessageBytes: 16 * 1024 * 1024,
-  maxOperationsPerUpdate: 100_000,
-  maxIdentifierDepth: 1_024,
-  maxVersionSites: 65_536,
-  maxSparseReceipts: 1_000_000,
-  maxSnapshotItems: 2_000_000,
-  maxPendingOperations: 250_000,
-  maxDeferredDeletes: 2_000_000,
-  maxDocumentUnits: 2_000_000,
-  maxAllocationAttempts: 65_536,
-  maxRetainedOperations: 4_000_000,
-  maxUndoTransactions: 10_000,
-};
-
-/**
- * Encode a document configuration for `esbt_doc_create_configured`
- * (config format v1; the exact layout is documented in `src/config.rs`).
- *
- * All fields are optional; defaults match `Document.with_defaults`:
- * `{ dmax, base, depth, strategy: { kind, boundary }, adaptiveDmax:
- * { floor, ceiling, window, holdoffWindows }, limits: { ...LIMIT_FIELDS } }`.
- */
-export function encodeDocumentConfig(config = {}) {
-  const bytes = [1, 0]; // format version u16 LE
-  const flags = (config.adaptiveDmax ? 0b01 : 0) | 0b10; // limits always sent
-  bytes.push(flags);
-  pushVarint(bytes, config.dmax ?? 65_536);
-  pushVarint(bytes, config.base ?? 2_147_483_647);
-  pushVarint(bytes, config.depth ?? 256);
-  const strategy = config.strategy ?? { kind: "midpoint" };
-  const tag = STRATEGY_TAGS[strategy.kind];
-  if (tag === undefined) throw new EsbtError(4, `esbt: unknown strategy ${strategy.kind}`);
-  bytes.push(tag);
-  if (tag !== 0) pushVarint(bytes, strategy.boundary ?? 64);
-  if (config.adaptiveDmax) {
-    pushVarint(bytes, config.adaptiveDmax.floor ?? 16);
-    pushVarint(bytes, config.adaptiveDmax.ceiling ?? 2_147_483_648);
-    pushVarint(bytes, config.adaptiveDmax.window ?? 256);
-    pushVarint(bytes, config.adaptiveDmax.holdoffWindows ?? 4);
+  /**
+   * Instantiate Jco's core-Wasm output. `getCoreModule` is injectable for
+   * Node tests, service workers, caches, and integrity-verifying loaders.
+   */
+  static async load(options = {}) {
+    if (typeof options === "string" || options instanceof URL) {
+      options = { baseUrl: options };
+    }
+    const baseUrl = new URL(options.baseUrl ?? "./generated/", import.meta.url);
+    const getCoreModule =
+      options.getCoreModule ??
+      (async (name) => {
+        const url = new URL(name, baseUrl);
+        return compileResponse(await fetch(url), url);
+      });
+    const root = await instantiate(getCoreModule, {});
+    if (!root?.engine) throw new Error("esbt: component did not export the WIT engine interface");
+    return new EsbtRuntime(root.engine);
   }
-  const limits = { ...DEFAULT_LIMITS, ...(config.limits ?? {}) };
-  for (const field of LIMIT_FIELDS) pushVarint(bytes, limits[field]);
-  return new Uint8Array(bytes);
+
+  defaultConfig() {
+    return this.engine.defaultConfig();
+  }
+
+  resolveConfig(config = {}) {
+    const defaults = this.defaultConfig();
+    const strategy = config.strategy
+      ? {
+          kind: config.strategy.kind,
+          boundary:
+            config.strategy.kind === "midpoint" ? 0 : (config.strategy.boundary ?? 64),
+        }
+      : defaults.strategy;
+    const adaptiveDmax = Object.hasOwn(config, "adaptiveDmax")
+      ? config.adaptiveDmax == null
+        ? undefined
+        : { ...this.engine.defaultAdaptiveDmaxConfig(), ...config.adaptiveDmax }
+      : defaults.adaptiveDmax;
+    return {
+      dmax: config.dmax ?? defaults.dmax,
+      base: config.base ?? defaults.base,
+      depth: config.depth ?? defaults.depth,
+      strategy,
+      adaptiveDmax,
+      limits: { ...defaults.limits, ...(config.limits ?? {}) },
+    };
+  }
+
+  classifyArtifact(bytes) {
+    return callComponent(() => this.engine.classifyArtifact(asBytes(bytes)));
+  }
+
+  emptyVersion() {
+    return this.engine.emptyVersion().slice();
+  }
 }
 
 export class EsbtDocument {
   static async create(options = {}) {
-    const runtime = options.runtime ?? (await EsbtRuntime.load(options.wasmUrl));
-    const siteWords = normalizeSiteId(options.siteId);
-    const handle = options.config
-      ? runtime.withBytes(encodeDocumentConfig(options.config), (pointer, length) =>
-          runtime.check(
-            runtime.exports.esbt_doc_create_configured(...siteWords, pointer, length),
-          ),
-        )
-      : runtime.check(runtime.exports.esbt_doc_create(...siteWords));
-    if (handle === 0) throw new EsbtError(24, "esbt: document creation returned no handle");
-    return new EsbtDocument(runtime, handle, siteWords);
+    const runtime =
+      options.runtime ??
+      (await EsbtRuntime.load({
+        baseUrl: options.componentBaseUrl,
+        getCoreModule: options.getCoreModule,
+      }));
+    const site = normalizeSiteId(options.siteId);
+    const component = callComponent(() =>
+      runtime.engine.create(site, runtime.resolveConfig(options.config)),
+    );
+    return new EsbtDocument(runtime, component, siteToHex(site));
   }
 
-  constructor(runtime, handle, siteWords) {
+  constructor(runtime, component, siteId) {
     this.runtime = runtime;
-    this.handle = handle >>> 0;
-    this.siteId = wordsToHex(siteWords);
+    this.component = component;
+    this.siteId = siteId;
     this.localUpdateListeners = new Set();
     this.changeListeners = new Set();
     this.transactionDepth = 0;
@@ -187,7 +135,7 @@ export class EsbtDocument {
 
   destroy() {
     if (this.destroyed) return;
-    this.runtime.check(this.runtime.exports.esbt_doc_destroy(this.handle));
+    this.component[DISPOSE]?.();
     this.destroyed = true;
     this.localUpdateListeners.clear();
     this.changeListeners.clear();
@@ -195,37 +143,50 @@ export class EsbtDocument {
 
   get length() {
     this.assertLive();
-    return this.runtime.check(this.runtime.exports.esbt_doc_len(this.handle));
+    return this.component.length();
   }
 
   getText() {
     this.assertLive();
-    this.runtime.check(this.runtime.exports.esbt_doc_text_utf16(this.handle));
-    return decodeUtf16(this.runtime.last());
+    return decodeUtf16(this.component.text());
   }
 
   stateHash() {
     this.assertLive();
-    return this.runtime.exports.esbt_doc_hash(this.handle) >>> 0;
+    return this.component.stateHash();
   }
 
   get pendingOperations() {
     this.assertLive();
-    return this.runtime.check(this.runtime.exports.esbt_doc_pending(this.handle));
+    return this.component.pendingOperations();
+  }
+
+  get retainedOperations() {
+    this.assertLive();
+    return this.component.retainedOperations();
   }
 
   version() {
     this.assertLive();
-    this.runtime.check(this.runtime.exports.esbt_doc_version(this.handle));
-    return this.runtime.last();
+    return this.component.version().slice();
   }
 
-  transact(fn, options = {}) {
+  historyFloor() {
+    this.assertLive();
+    return this.component.historyFloor().slice();
+  }
+
+  currentDmax() {
+    this.assertLive();
+    return this.component.currentDmax();
+  }
+
+  transact(callback, options = {}) {
     this.assertLive();
     if (this.transactionDepth > 0) {
       this.transactionDepth += 1;
       try {
-        const value = fn();
+        const value = callback();
         if (value && typeof value.then === "function") {
           throw new TypeError("esbt: transact callback must be synchronous");
         }
@@ -235,27 +196,24 @@ export class EsbtDocument {
       }
     }
 
-    const [hasGroup, low, high] = encodeUndoGroup(options.undoGroup);
-    this.runtime.check(
-      this.runtime.exports.esbt_doc_begin(this.handle, hasGroup, low, high),
-    );
+    callComponent(() => this.component.beginTransaction(normalizeUndoGroup(options.undoGroup)));
     this.transactionDepth = 1;
     this.transactionOrigin = options.origin;
     try {
-      const value = fn();
+      const value = callback();
       if (value && typeof value.then === "function") {
         throw new TypeError("esbt: transact callback must be synchronous");
       }
       this.transactionDepth = 0;
-      const result = this.runtime.check(this.runtime.exports.esbt_doc_commit(this.handle));
-      this.consumeLocalResult(result, this.transactionOrigin);
+      const change = callComponent(() => this.component.commitTransaction());
+      this.consumeLocalChange(change, this.transactionOrigin);
       return value;
     } catch (error) {
       this.transactionDepth = 0;
       try {
-        this.runtime.check(this.runtime.exports.esbt_doc_abort(this.handle));
-      } catch (_) {
-        // The Rust edit path already rolls back a transaction that fails.
+        callComponent(() => this.component.abortTransaction());
+      } catch {
+        // A failing Rust edit atomically rolls its active transaction back.
       }
       throw error;
     } finally {
@@ -268,40 +226,26 @@ export class EsbtDocument {
   }
 
   delete(index, length, options = {}) {
-    this.assertLive();
-    const [hasGroup, low, high] = encodeUndoGroup(options.undoGroup);
-    const result = this.runtime.check(
-      this.runtime.exports.esbt_doc_delete(
-        this.handle,
-        checkedIndex(index),
-        checkedIndex(length),
-        hasGroup,
-        low,
-        high,
-      ),
-    );
-    return this.consumeLocalResult(result, options.origin);
+    const start = checkedIndex(index);
+    const count = checkedIndex(length);
+    const end = start + count;
+    if (!Number.isSafeInteger(end) || end > 0xffff_ffff) {
+      throw new RangeError("esbt: deletion endpoint exceeds u32");
+    }
+    return this.replaceRange(start, end, "", options);
   }
 
   replaceRange(from, to, insertedText, options = {}) {
     this.assertLive();
-    const bytes = encodeUtf16(String(insertedText));
-    const [hasGroup, low, high] = encodeUndoGroup(options.undoGroup);
-    const result = this.runtime.withBytes(bytes, (pointer, length) =>
-      this.runtime.check(
-        this.runtime.exports.esbt_doc_replace_utf16(
-          this.handle,
-          checkedIndex(from),
-          checkedIndex(to),
-          pointer,
-          length,
-          hasGroup,
-          low,
-          high,
-        ),
+    const change = callComponent(() =>
+      this.component.replace(
+        checkedIndex(from),
+        checkedIndex(to),
+        encodeUtf16(String(insertedText)),
+        normalizeUndoGroup(options.undoGroup),
       ),
     );
-    return this.consumeLocalResult(result, options.origin);
+    return this.consumeLocalChange(change, options.origin);
   }
 
   setText(text, options = {}) {
@@ -310,177 +254,112 @@ export class EsbtDocument {
 
   indexToAnchor(index, affinity = "after") {
     this.assertLive();
-    const encodedAffinity = affinity === "before" ? 1 : affinity === "after" ? 2 : 0;
-    const result = this.runtime.check(
-      this.runtime.exports.esbt_doc_anchor(
-        this.handle,
-        checkedIndex(index),
-        encodedAffinity,
-      ),
+    return callComponent(() =>
+      this.component.anchor(checkedIndex(index), checkedAffinity(affinity)).slice(),
     );
-    if (result < 1) throw new EsbtError(25, "esbt: anchor creation returned no bytes");
-    return this.runtime.last();
   }
 
   anchorToIndex(anchor) {
     this.assertLive();
-    return this.runtime.withBytes(anchor, (pointer, length) =>
-      this.runtime.check(
-        this.runtime.exports.esbt_doc_resolve_anchor(this.handle, pointer, length),
-      ),
+    return callComponent(() => this.component.resolveAnchor(asBytes(anchor)));
+  }
+
+  captureCausalPosition(index, affinity = "after") {
+    this.assertLive();
+    return callComponent(() =>
+      this.component
+        .captureCausalPosition(checkedIndex(index), checkedAffinity(affinity))
+        .slice(),
     );
+  }
+
+  resolveCausalPosition(position) {
+    this.assertLive();
+    return callComponent(() => this.component.resolveCausalPosition(asBytes(position))) ?? null;
   }
 
   insertAtAnchor(anchor, text, options = {}) {
     this.assertLive();
-    const textBytes = encodeUtf16(String(text));
-    const [hasGroup, low, high] = encodeUndoGroup(options.undoGroup);
-    const resultLength = this.runtime.withTwoBuffers(
-      anchor,
-      textBytes,
-      (anchorPointer, anchorLength, textPointer, textLength) =>
-        this.runtime.check(
-          this.runtime.exports.esbt_doc_insert_at_anchor_utf16(
-            this.handle,
-            anchorPointer,
-            anchorLength,
-            textPointer,
-            textLength,
-            hasGroup,
-            low,
-            high,
-          ),
-        ),
+    const result = callComponent(() =>
+      this.component.insertAtAnchor(
+        asBytes(anchor),
+        encodeUtf16(String(text)),
+        normalizeUndoGroup(options.undoGroup),
+      ),
     );
-    if (resultLength < 8) throw new EsbtError(4, "esbt: malformed insert-at-anchor result");
-    const bytes = this.runtime.last();
-    const reader = new ByteReader(bytes);
-    const nextAnchor = reader.bytes(reader.u32());
-    const update = reader.bytes(reader.u32());
-    reader.finish();
-    if (update.length > 0) {
-      this.emitLocalUpdate(update, this.readVisibleEdits(), options.origin);
-    }
-    return { anchor: nextAnchor, update: update.length > 0 ? update : null };
+    const update = this.consumeLocalChange(result.change, options.origin);
+    return { anchor: result.anchor.slice(), update };
   }
 
   applyUpdate(bytes) {
     this.assertLive();
-    const receiptBytes = this.runtime.withBytes(bytes, (pointer, length) => {
-      this.runtime.check(this.runtime.exports.esbt_doc_apply(this.handle, pointer, length));
-      return this.runtime.last();
-    });
-    const receipt = decodeApplyReceipt(receiptBytes);
-    receipt.visibleEdits = this.readVisibleEdits();
-    if (receipt.visibleChanged !== (receipt.visibleEdits.length > 0)) {
-      throw new EsbtError(4, "esbt: apply receipt disagrees with visible edits");
-    }
-    if (receipt.visibleEdits.length > 0) {
-      this.emitChange(receipt.visibleEdits, undefined, false);
-    }
-    return receipt;
+    const receipt = callComponent(() => this.component.applyUpdate(asBytes(bytes)));
+    const mapped = mapApplyReceipt(receipt);
+    if (mapped.visibleEdits.length > 0) this.emitChange(mapped.visibleEdits, undefined, false);
+    return mapped;
   }
 
   applySnapshot(bytes) {
     this.assertLive();
-    const receiptBytes = this.runtime.withBytes(bytes, (pointer, length) => {
-      this.runtime.check(
-        this.runtime.exports.esbt_doc_apply_snapshot(this.handle, pointer, length),
-      );
-      return this.runtime.last();
-    });
-    const receipt = decodeSnapshotReceipt(receiptBytes);
-    receipt.visibleEdits = this.readVisibleEdits();
-    if (receipt.visibleChanged !== (receipt.visibleEdits.length > 0)) {
-      throw new EsbtError(4, "esbt: snapshot receipt disagrees with visible edits");
-    }
-    if (receipt.visibleEdits.length > 0) {
-      this.emitChange(receipt.visibleEdits, undefined, false);
-    }
-    return receipt;
+    const receipt = callComponent(() => this.component.applySnapshot(asBytes(bytes)));
+    const mapped = mapSnapshotReceipt(receipt);
+    if (mapped.visibleEdits.length > 0) this.emitChange(mapped.visibleEdits, undefined, false);
+    return mapped;
   }
 
   import(bytes) {
-    const tag = envelopeTag(bytes);
-    if (tag === 3 || tag === 6) return this.applySnapshot(bytes);
-    if (tag === 5) return this.applyUpdate(bytes);
-    throw new EsbtError(4, "esbt: unsupported import envelope");
+    const artifact = asBytes(bytes);
+    switch (this.runtime.classifyArtifact(artifact)) {
+      case "update":
+        return this.applyUpdate(artifact);
+      case "compact-snapshot":
+      case "full-snapshot":
+        return this.applySnapshot(artifact);
+      default:
+        throw new EsbtError(4, "esbt: artifact is not importable document state");
+    }
   }
 
   exportFullSnapshot() {
     this.assertLive();
-    this.runtime.check(this.runtime.exports.esbt_doc_export_full_snapshot(this.handle));
-    return this.runtime.last();
+    return callComponent(() => this.component.exportFullSnapshot().slice());
   }
 
   exportCompactSnapshot() {
     this.assertLive();
-    this.runtime.check(this.runtime.exports.esbt_doc_export_compact_snapshot(this.handle));
-    return this.runtime.last();
+    return callComponent(() => this.component.exportCompactSnapshot().slice());
   }
 
-  exportUpdate(remoteVersion = new Uint8Array([0, 0, 0, 0])) {
+  exportUpdate(remoteVersion = this.runtime.emptyVersion()) {
     this.assertLive();
-    return this.runtime.withBytes(remoteVersion, (pointer, length) => {
-      this.runtime.check(
-        this.runtime.exports.esbt_doc_export_update(this.handle, pointer, length),
-      );
-      return this.runtime.last();
-    });
+    return callComponent(() => this.component.exportUpdate(asBytes(remoteVersion)).slice());
   }
 
   pruneHistoryThrough(version) {
     this.assertLive();
-    return this.runtime.withBytes(version, (pointer, length) =>
-      this.runtime.check(
-        this.runtime.exports.esbt_doc_prune_history(this.handle, pointer, length),
-      ),
-    );
-  }
-
-  /** Retained journal size — the quantity compaction policy must bound. */
-  get retainedOperations() {
-    this.assertLive();
-    return this.runtime.check(
-      this.runtime.exports.esbt_doc_retained_operations(this.handle),
-    );
-  }
-
-  /** Encoded causal prefix below which reconnect deltas are unavailable. */
-  historyFloor() {
-    this.assertLive();
-    this.runtime.check(this.runtime.exports.esbt_doc_history_floor(this.handle));
-    return this.runtime.last();
-  }
-
-  /** Current Dmax (moves over time when the adaptive controller is on). */
-  currentDmax() {
-    this.assertLive();
-    this.runtime.check(this.runtime.exports.esbt_doc_current_dmax(this.handle));
-    const bytes = this.runtime.last();
-    return Number(new DataView(bytes.buffer, bytes.byteOffset, 8).getBigInt64(0, true));
+    return callComponent(() => this.component.pruneHistoryThrough(asBytes(version)));
   }
 
   get canUndo() {
     this.assertLive();
-    return this.runtime.check(this.runtime.exports.esbt_doc_can_undo(this.handle)) === 1;
+    return this.component.canUndo();
   }
 
   get canRedo() {
     this.assertLive();
-    return this.runtime.check(this.runtime.exports.esbt_doc_can_redo(this.handle)) === 1;
+    return this.component.canRedo();
   }
 
   undo(options = {}) {
     this.assertLive();
-    const result = this.runtime.check(this.runtime.exports.esbt_doc_undo(this.handle));
-    return this.consumeLocalResult(result, options.origin ?? "undo");
+    const change = callComponent(() => this.component.undo());
+    return this.consumeLocalChange(change, options.origin ?? "undo");
   }
 
   redo(options = {}) {
     this.assertLive();
-    const result = this.runtime.check(this.runtime.exports.esbt_doc_redo(this.handle));
-    return this.consumeLocalResult(result, options.origin ?? "redo");
+    const change = callComponent(() => this.component.redo());
+    return this.consumeLocalChange(change, options.origin ?? "redo");
   }
 
   onLocalUpdate(listener) {
@@ -493,28 +372,26 @@ export class EsbtDocument {
     return () => this.changeListeners.delete(listener);
   }
 
-  consumeLocalResult(result, origin) {
-    if (result === 0) return null;
-    const update = this.runtime.last();
-    this.emitLocalUpdate(update, this.readVisibleEdits(), origin);
+  consumeLocalChange(change, origin) {
+    if (!change) return null;
+    const update = change.update.slice();
+    const edits = change.visibleEdits.map(mapVisibleEdit);
+    if (change.visibleChanged !== (edits.length > 0)) {
+      throw new EsbtError(4, "esbt: local change disagrees with its visible edits");
+    }
+    this.emitLocalUpdate(update, edits, origin);
     return update;
   }
 
   emitLocalUpdate(update, edits, origin) {
-    const stable = update.slice();
     for (const listener of [...this.localUpdateListeners]) {
       try {
-        listener(stable.slice());
+        listener(update.slice());
       } catch (error) {
         surfaceListenerError(error);
       }
     }
     if (edits.length > 0) this.emitChange(edits, origin, true);
-  }
-
-  readVisibleEdits() {
-    this.runtime.check(this.runtime.exports.esbt_doc_visible_edits(this.handle));
-    return decodeVisibleEdits(this.runtime.last());
   }
 
   emitChange(edits, origin, local) {
@@ -530,6 +407,120 @@ export class EsbtDocument {
   }
 }
 
+function mapVisibleEdit(edit) {
+  return { from: edit.from, to: edit.to, insert: decodeUtf16(edit.inserted) };
+}
+
+function mapOperationRef(identity) {
+  return { origin: siteToHex(identity.origin), sequence: identity.sequence };
+}
+
+function mapApplyReceipt(receipt) {
+  const visibleEdits = receipt.visibleEdits.map(mapVisibleEdit);
+  if (receipt.visibleChanged !== (visibleEdits.length > 0)) {
+    throw new EsbtError(4, "esbt: apply receipt disagrees with its visible edits");
+  }
+  return {
+    outcome: receipt.outcome,
+    acceptedOperations: receipt.acceptedOperations.map(mapOperationRef),
+    appliedOperations: receipt.appliedOperations.map(mapOperationRef),
+    bufferedOperations: receipt.bufferedOperations.map(mapOperationRef),
+    newlyReadyOperations: receipt.newlyReadyOperations.map(mapOperationRef),
+    version: receipt.version.slice(),
+    visibleChanged: receipt.visibleChanged,
+    visibleEdits,
+    journalBytes: receipt.journal?.slice() ?? null,
+  };
+}
+
+function mapSnapshotReceipt(receipt) {
+  const visibleEdits = receipt.visibleEdits.map(mapVisibleEdit);
+  if (receipt.visibleChanged !== (visibleEdits.length > 0)) {
+    throw new EsbtError(4, "esbt: snapshot receipt disagrees with its visible edits");
+  }
+  return {
+    kind: receipt.kind,
+    version: receipt.version.slice(),
+    visibleChanged: receipt.visibleChanged,
+    visibleEdits,
+    undo: receipt.undo,
+  };
+}
+
+function normalizeSiteId(siteId) {
+  let value;
+  if (siteId === undefined || siteId === null) {
+    const bytes = crypto.getRandomValues(new Uint8Array(16));
+    if (bytes.every((byte) => byte === 0)) bytes[15] = 1;
+    value = BigInt(`0x${bytesToHex(bytes)}`);
+  } else if (typeof siteId === "string") {
+    const hex = siteId.replaceAll("-", "").toLowerCase();
+    if (!/^[0-9a-f]{32}$/.test(hex)) {
+      throw new TypeError("esbt: siteId must be a 128-bit hexadecimal string");
+    }
+    value = BigInt(`0x${hex}`);
+  } else if (siteId instanceof Uint8Array && siteId.length === 16) {
+    value = BigInt(`0x${bytesToHex(siteId)}`);
+  } else {
+    throw new TypeError("esbt: siteId must be a 16-byte array or 32-digit hex string");
+  }
+  if (value <= 0n || value > U128_MAX) throw new TypeError("esbt: siteId is zero or out of range");
+  return { low: value & U64_MAX, high: value >> 64n };
+}
+
+function siteToHex(site) {
+  return ((site.high << 64n) | site.low).toString(16).padStart(32, "0");
+}
+
+function bytesToHex(bytes) {
+  return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function normalizeUndoGroup(group) {
+  if (group === undefined || group === null) return undefined;
+  const value = BigInt(group);
+  if (value < 0n || value > U64_MAX) throw new RangeError("esbt: undoGroup is outside u64");
+  return value;
+}
+
+function checkedIndex(value) {
+  if (!Number.isInteger(value) || value < 0 || value > 0xffff_ffff) {
+    throw new RangeError("esbt: index must be a nonnegative u32 integer");
+  }
+  return value;
+}
+
+function checkedAffinity(value) {
+  if (value !== "before" && value !== "after") {
+    throw new TypeError("esbt: affinity must be 'before' or 'after'");
+  }
+  return value;
+}
+
+function asBytes(value) {
+  if (value instanceof Uint8Array) return value;
+  if (ArrayBuffer.isView(value)) {
+    return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  }
+  if (value instanceof ArrayBuffer) return new Uint8Array(value);
+  throw new TypeError("esbt: expected a byte array");
+}
+
+function encodeUtf16(text) {
+  const units = new Uint16Array(text.length);
+  for (let index = 0; index < text.length; index += 1) units[index] = text.charCodeAt(index);
+  return units;
+}
+
+function decodeUtf16(units) {
+  const chunks = [];
+  const chunkSize = 16_384;
+  for (let offset = 0; offset < units.length; offset += chunkSize) {
+    chunks.push(String.fromCharCode(...units.subarray(offset, offset + chunkSize)));
+  }
+  return chunks.join("");
+}
+
 function surfaceListenerError(error) {
   if (typeof globalThis.reportError === "function") {
     globalThis.reportError(error);
@@ -538,221 +529,4 @@ function surfaceListenerError(error) {
   queueMicrotask(() => {
     throw error;
   });
-}
-
-function normalizeSiteId(siteId) {
-  if (siteId === undefined || siteId === null) {
-    const words = crypto.getRandomValues(new Uint32Array(4));
-    if (words.every((word) => word === 0)) words[0] = 1;
-    return [...words];
-  }
-  if (typeof siteId === "string") {
-    const hex = siteId.replaceAll("-", "").toLowerCase();
-    if (!/^[0-9a-f]{32}$/.test(hex) || /^0+$/.test(hex)) {
-      throw new TypeError("esbt: siteId must be a nonzero 128-bit hexadecimal string");
-    }
-    const bytes = Uint8Array.from(hex.match(/../g), (part) => Number.parseInt(part, 16));
-    return bytesToWords(bytes);
-  }
-  if (siteId instanceof Uint8Array && siteId.length === 16) {
-    if (siteId.every((byte) => byte === 0)) throw new TypeError("esbt: siteId is zero");
-    return bytesToWords(siteId);
-  }
-  throw new TypeError("esbt: siteId must be a 16-byte array or 32-digit hex string");
-}
-
-function bytesToWords(bigEndianBytes) {
-  const words = [];
-  for (let word = 0; word < 4; word++) {
-    let value = 0;
-    for (let byte = 0; byte < 4; byte++) {
-      value = (value << 8) | bigEndianBytes[(3 - word) * 4 + byte];
-    }
-    words.push(value >>> 0);
-  }
-  return words;
-}
-
-function wordsToHex(words) {
-  return [...words]
-    .reverse()
-    .map((word) => (word >>> 0).toString(16).padStart(8, "0"))
-    .join("");
-}
-
-function encodeUndoGroup(group) {
-  if (group === undefined || group === null) return [0, 0, 0];
-  const value = BigInt(group);
-  if (value < 0n || value > 0xffff_ffff_ffff_ffffn) {
-    throw new RangeError("esbt: undoGroup is outside u64");
-  }
-  return [1, Number(value & 0xffff_ffffn), Number(value >> 32n)];
-}
-
-function checkedIndex(value) {
-  if (!Number.isInteger(value) || value < 0 || value > 0xffff_ffff) {
-    throw new RangeError("esbt: index must be a nonnegative u32 integer");
-  }
-  return value >>> 0;
-}
-
-function encodeUtf16(text) {
-  const bytes = new Uint8Array(text.length * 2);
-  const view = new DataView(bytes.buffer);
-  for (let index = 0; index < text.length; index++) {
-    view.setUint16(index * 2, text.charCodeAt(index), true);
-  }
-  return bytes;
-}
-
-function decodeUtf16(bytes) {
-  if (bytes.length % 2 !== 0) throw new EsbtError(4, "esbt: odd UTF-16 result length");
-  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  const chunks = [];
-  const chunkSize = 16_384;
-  for (let offset = 0; offset < bytes.length / 2; offset += chunkSize) {
-    const end = Math.min(bytes.length / 2, offset + chunkSize);
-    const units = new Array(end - offset);
-    for (let index = offset; index < end; index++) {
-      units[index - offset] = view.getUint16(index * 2, true);
-    }
-    chunks.push(String.fromCharCode(...units));
-  }
-  return chunks.join("");
-}
-
-function decodeVisibleEdits(bytes) {
-  const reader = new ByteReader(bytes);
-  if (reader.u16() !== 1) throw new EsbtError(5, "esbt: unsupported visible-edit receipt");
-  const count = reader.u32();
-  const edits = [];
-  for (let index = 0; index < count; index++) {
-    const from = reader.u32();
-    const to = reader.u32();
-    const units = reader.u32();
-    if (to < from || units > 1_000_000) {
-      throw new EsbtError(4, "esbt: invalid visible-edit range");
-    }
-    edits.push({ from, to, insert: decodeUtf16(reader.bytes(units * 2)) });
-  }
-  reader.finish();
-  return edits;
-}
-
-function envelopeTag(bytes) {
-  if (
-    !(bytes instanceof Uint8Array) ||
-    bytes.length < 11 ||
-    bytes[0] !== 0x45 ||
-    bytes[1] !== 0x53 ||
-    bytes[2] !== 0x42 ||
-    bytes[3] !== 0x4d
-  ) {
-    return -1;
-  }
-  return bytes[6];
-}
-
-function decodeApplyReceipt(bytes) {
-  const reader = new ByteReader(bytes);
-  if (reader.u16() !== 1) throw new EsbtError(5, "esbt: unsupported apply receipt");
-  const outcomes = ["invalid", "applied", "duplicate", "buffered", "mixed", "noop"];
-  const outcome = outcomes[reader.u8()];
-  const visibleChanged = reader.u8() === 1;
-  const lists = [];
-  for (let list = 0; list < 4; list++) {
-    const identities = [];
-    const count = reader.u32();
-    for (let index = 0; index < count; index++) {
-      identities.push({ origin: reader.siteId(), sequence: reader.u64() });
-    }
-    lists.push(identities);
-  }
-  const version = reader.bytes(reader.u32());
-  const journal = reader.bytes(reader.u32());
-  reader.finish();
-  return {
-    outcome,
-    visibleChanged,
-    acceptedOperations: lists[0],
-    appliedOperations: lists[1],
-    bufferedOperations: lists[2],
-    newlyReadyOperations: lists[3],
-    version,
-    journalBytes: journal.length > 0 ? journal : null,
-    visibleEdits: [],
-  };
-}
-
-function decodeSnapshotReceipt(bytes) {
-  const reader = new ByteReader(bytes);
-  if (reader.u16() !== 1) throw new EsbtError(5, "esbt: unsupported snapshot receipt");
-  const kind = reader.u8() === 1 ? "full" : "compact";
-  const visibleChanged = reader.u8() === 1;
-  const undo = ["invalid", "preserved", "cleared", "partially-preserved"][reader.u8()];
-  if (!undo) throw new EsbtError(4, "esbt: invalid snapshot undo disposition");
-  const version = reader.bytes(reader.u32());
-  reader.finish();
-  return { kind, visibleChanged, undo, version, visibleEdits: [] };
-}
-
-class ByteReader {
-  constructor(bytes) {
-    this.value = bytes;
-    this.view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-    this.offset = 0;
-  }
-
-  require(length) {
-    if (this.offset + length > this.value.length) {
-      throw new EsbtError(4, "esbt: truncated Wasm result");
-    }
-  }
-
-  u8() {
-    this.require(1);
-    return this.value[this.offset++];
-  }
-
-  u16() {
-    this.require(2);
-    const value = this.view.getUint16(this.offset, true);
-    this.offset += 2;
-    return value;
-  }
-
-  u32() {
-    this.require(4);
-    const value = this.view.getUint32(this.offset, true);
-    this.offset += 4;
-    return value;
-  }
-
-  u64() {
-    this.require(8);
-    const value = this.view.getBigUint64(this.offset, true);
-    this.offset += 8;
-    return value;
-  }
-
-  siteId() {
-    const littleEndian = this.bytes(16);
-    return [...littleEndian]
-      .reverse()
-      .map((byte) => byte.toString(16).padStart(2, "0"))
-      .join("");
-  }
-
-  bytes(length) {
-    this.require(length);
-    const value = this.value.slice(this.offset, this.offset + length);
-    this.offset += length;
-    return value;
-  }
-
-  finish() {
-    if (this.offset !== this.value.length) {
-      throw new EsbtError(6, "esbt: trailing bytes in Wasm result");
-    }
-  }
 }

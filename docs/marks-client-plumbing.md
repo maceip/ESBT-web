@@ -1,8 +1,9 @@
 # Marks client plumbing guide
 
-How the marks client (maceip/marks) should wire the ESBT engine's production
-surface — `web/esbt-document.js` over the `esbt_doc_*` Wasm ABI — so the
-engine's operational guarantees actually hold in the product. The engine
+How the marks client (maceip/marks) wires the ESBT engine's production
+surface — generated bindings from `esbt:document@1.0.0`, wrapped by a small
+typed TypeScript owner — so the engine's operational guarantees hold in the
+product. The engine
 deliberately does not schedule its own compaction, persistence, or transport;
 this document specifies the loops the client must own, with the exact API
 for each.
@@ -13,9 +14,8 @@ persistence, and the WebSocket server are marks concerns.
 
 ## 1. Document creation and configuration
 
-`EsbtDocument.create` now accepts a `config` object which is encoded
-(`encodeDocumentConfig`, config format v1 — byte layout documented in
-`src/config.rs`) and passed to `esbt_doc_create_configured`:
+`EsbtDocument.create` accepts a config object that is lifted directly into
+the WIT `document-config` record. There is no configuration byte codec:
 
 ```js
 const doc = await EsbtDocument.create({
@@ -63,6 +63,23 @@ document from a full snapshot (`exportFullSnapshot` → `applySnapshot` on the
 new handle), which is cheap and preserves everything including pending
 operations.
 
+### Site identity: one live generator
+
+A site names one operation-generator lineage, not a user, device, tab, room,
+or document. The invariant is **one live generator per site**:
+
+- Never let two live processes generate operations with the same site. They
+  can mint the same operation and insertion counters with different content,
+  which is an identity conflict rather than a merge.
+- Resuming the same site is safe only when the exact generator state and its
+  highest counters were restored and the former process is known dead.
+- Creating a fresh site and applying the old full snapshot is also safe. The
+  snapshot retains receipts for prior sites, while new local operations use
+  the new site's counter space. Marks uses this safer session admission rule.
+
+Persisted document state therefore does not, by itself, authorize reusing a
+site. Site admission and single-writer exclusion remain product concerns.
+
 ## 2. Memory: the compaction loop the client must own
 
 Three engine structures grow with history, not with document size:
@@ -73,8 +90,10 @@ Three engine structures grow with history, not with document size:
 | Delete log | deletes whose insertion hasn't arrived | automatic once the insertion arrives |
 | Pending queue (`pendingOperations`) | causally early ops | automatic once prerequisites arrive |
 
-Only the retained journal is unbounded under normal operation. The engine
-exposes the policy inputs and the knife; marks must supply the loop:
+Only the retained journal grows continuously under normal operation. It is
+resource-capped (and will eventually reject more history), but normal memory
+control still requires the loop below. The engine exposes the policy inputs
+and the knife; Marks supplies the schedule:
 
 ```js
 // After the server acknowledges durable receipt of a causally closed
@@ -100,9 +119,9 @@ Suggested policy (all inputs already exposed):
    exact pending set — it is the complete crash-recovery artifact
    (verified byte-for-byte by `tests/adverse_network.rs`).
 3. On startup, `applySnapshot(persistedBytes)` on a pristine document
-   restores state, pending operations, and identity counters; then run the
-   reconnect flow below. Never re-mint a site ID for a document that has a
-   persisted snapshot — identity continuity comes from the snapshot.
+   restores state, pending operations, and receipt frontiers; then run the
+   reconnect flow below. Use a fresh admitted site unless the exact prior
+   generator state is being exclusively resumed under the rule above.
 4. Also checkpoint before `document.destroy()` and on `beforeunload`.
 
 The pending queue and delete log need no policy, but surface
@@ -140,8 +159,8 @@ try {
 }
 ```
 
-The receiving side calls `doc.import(bytes)` — snapshots and updates are
-distinguished by envelope tag. A compact-snapshot rebase *preserves* the
+The receiving side calls `doc.import(bytes)` — the component validates and
+classifies the unified ESBT envelope. A compact-snapshot rebase *preserves* the
 receiver's unsynced local edits (they are retained journal and are replayed
 over the new base); after the rebase the receiver's own edits still need to
 flow back with `exportUpdate`, so always finish with one normal round.
@@ -157,7 +176,7 @@ operation identities.
 
 ## 4. Transport framing: batch through transactions
 
-Since engine format v3, an update payload carries one site dictionary and
+The canonical Update payload carries one site dictionary and
 front-codes identifier paths across its operations, so bytes-per-operation
 falls sharply with batch size (a 400-op batch measures ~14 B/op vs ~28 B/op
 encoded singly). The client controls batching with transactions:
@@ -170,10 +189,10 @@ doc.transact(() => {
 
 - Wrap each editor change-set (CodeMirror transaction) in one
   `doc.transact`, never one update per keystroke.
-- The `canonical_bytes` emitted on commit are retry-safe: send them as-is,
+- The WIT `local-change.update` bytes emitted on commit are retry-safe: send them as-is,
   resend on doubt; duplicates are idempotent. Journal them verbatim on the
   server — the bytes are the canonical record.
-- Do not re-encode or split updates outside the engine; decode canonicality
+- Do not re-encode or split updates outside the component; decode canonicality
   (site tables, exact front-coding, minimal varints) will reject foreign
   re-encodings by design.
 

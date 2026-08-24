@@ -16,10 +16,9 @@ function roomId() {
 }
 
 function siteId() {
-  // A site identifies one live operation generator, not a room or product
-  // device. Reusing it in two tabs would let both mint the same counters.
-  // Restored state carries its old receipts, so a reload can safely join with
-  // a fresh generator identity.
+  // A site identifies exactly one live operation generator. A persisted site
+  // may resume only with its exact counter state and after the former process
+  // is known dead; this demo instead gives every page lifetime a fresh site.
   const bytes = crypto.getRandomValues(new Uint8Array(16));
   if (bytes.every((byte) => byte === 0)) bytes[0] = 1;
   return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
@@ -40,44 +39,38 @@ const mesh = new Mesh({
   onBytes(bytes) {
     if (!documentCore) {
       earlyMessages.push(bytes.slice());
-      return;
+      return true;
     }
-    ingest(bytes);
+    return ingest(bytes);
   },
   onPeer(info) {
     $("status").textContent = `${info.via} ${info.state || "joined"}`;
-    if (!documentCore) return;
-    try {
-      mesh.gossip(documentCore.exportFullSnapshot(), { force: true });
-    } catch (error) {
-      recordError(-1, error);
-    }
   },
 });
 
 function ingest(bytes) {
   const selection = selectionAnchors();
-  const tag = bytes.length >= 7 ? bytes[6] : -1;
+  let kind = "unknown";
   try {
+    kind = documentCore.runtime.classifyArtifact(bytes);
     const receipt = documentCore.import(bytes);
     lastIngest = {
-      tag,
+      kind,
       result: receipt?.outcome || receipt?.kind || "ok",
       bytes: bytes.length,
     };
-    // A newly opened peer advertises its full archive even when empty. Every
-    // established peer answers that advertisement with its own archive. Mesh
-    // content de-duplication makes this a finite anti-entropy exchange.
-    if (tag === 6) mesh.gossip(documentCore.exportFullSnapshot());
+    mesh.advertise();
   } catch (error) {
-    recordError(tag, error, bytes.length);
+    recordError(kind, error, bytes.length);
+    return false;
   }
   paint(selection);
   persist();
+  return true;
 }
 
-function recordError(tag, error, bytes = 0) {
-  lastIngest = { tag, result: error.code ?? -1, message: String(error.message || error), bytes };
+function recordError(kind, error, bytes = 0) {
+  lastIngest = { kind, result: error.code ?? -1, message: String(error.message || error), bytes };
   ingestErrors.push(lastIngest);
   if (ingestErrors.length > 16) ingestErrors.shift();
 }
@@ -231,7 +224,7 @@ function restoreLocal() {
   try {
     documentCore.applySnapshot(base64ToBytes(encoded));
   } catch (error) {
-    recordError(6, error);
+    recordError("full-snapshot", error);
   }
 }
 
@@ -264,17 +257,20 @@ $("finish").onclick = async () => {
   await mesh.applyAnswer($("sdp").value);
 };
 
-documentCore = await EsbtDocument.create({ siteId: SITE, wasmUrl: "./esbt.wasm" });
+documentCore = await EsbtDocument.create({ siteId: SITE });
 documentCore.onLocalUpdate((update) => {
   mesh.gossip(update);
   persist();
 });
 restoreLocal();
+mesh.setAntiEntropy({
+  getVersion: () => documentCore.version(),
+  makeDelta: (remoteVersion) => documentCore.exportUpdate(remoteVersion),
+  makeSnapshot: () => documentCore.exportFullSnapshot(),
+});
 for (const bytes of earlyMessages.splice(0)) ingest(bytes);
 paint();
-// This is both our initial state advertisement and, when empty, a request for
-// an established peer's full archive.
-mesh.gossip(documentCore.exportFullSnapshot());
+mesh.advertise();
 
 window.__esbtDemo = {
   site: SITE,

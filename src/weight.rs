@@ -1,6 +1,8 @@
 //! Definition 1 (Weight) and Definition 2 (total order).
 
+use crate::allocator::DMAX_HARD_CEILING;
 use crate::fraction::Fraction;
+use crate::{EngineError, ErrorCode};
 use core::cmp::Ordering;
 use core::fmt;
 
@@ -41,6 +43,55 @@ impl Weight {
             sc: if sc.is_empty() { vec![0] } else { sc },
             site,
         }
+    }
+
+    /// Validate a non-sentinel identifier admitted to a document.
+    ///
+    /// This is the single invariant check used by native `Update` values,
+    /// canonical wire decoding, snapshots, anchors, and `Document` admission.
+    /// Keeping it here prevents a forged native value from bypassing checks
+    /// that happen to exist in the byte decoder.
+    pub fn validate_document_identifier(
+        &self,
+        max_depth: Option<usize>,
+    ) -> Result<(), EngineError> {
+        if self.site == Self::EMPTY_SITE {
+            return Err(EngineError::new(
+                ErrorCode::InvalidOperation,
+                "document weight has the reserved zero site",
+            ));
+        }
+        if self.f.p <= 0 || self.f.q <= 0 {
+            return Err(EngineError::new(
+                ErrorCode::InvalidOperation,
+                "document weight fraction must be positive and finite",
+            ));
+        }
+        if Fraction::new(self.f.p, self.f.q) != self.f {
+            return Err(EngineError::new(
+                ErrorCode::InvalidOperation,
+                "document weight fraction must be reduced",
+            ));
+        }
+        if self.f.p > DMAX_HARD_CEILING || self.f.q > DMAX_HARD_CEILING {
+            return Err(EngineError::new(
+                ErrorCode::InvalidOperation,
+                "document weight fraction exceeds the global Dmax ceiling",
+            ));
+        }
+        if self.sc.is_empty() {
+            return Err(EngineError::new(
+                ErrorCode::InvalidOperation,
+                "document identifier path is empty",
+            ));
+        }
+        if max_depth.is_some_and(|maximum| self.sc.len() > maximum) {
+            return Err(EngineError::new(
+                ErrorCode::IdentifierTooDeep,
+                "document identifier exceeds the depth limit",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -100,5 +151,19 @@ mod tests {
         assert!(a < mid && mid < b && b < c);
         let d = Weight::new(Fraction::new(1, 4), 1, vec![0], 2);
         assert!(b < d);
+    }
+
+    #[test]
+    fn document_identifier_rejects_a_fraction_above_the_global_ceiling() {
+        let weight = Weight::new(
+            Fraction::new(DMAX_HARD_CEILING + 1, DMAX_HARD_CEILING),
+            0,
+            vec![0],
+            1,
+        );
+        let error = weight
+            .validate_document_identifier(None)
+            .expect_err("fraction above Dmax ceiling");
+        assert_eq!(error.code, ErrorCode::InvalidOperation);
     }
 }

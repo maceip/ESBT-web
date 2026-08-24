@@ -222,6 +222,10 @@ impl Version {
     }
 
     pub fn encode(&self) -> Vec<u8> {
+        crate::wire::Artifact::Version(self.clone()).encode()
+    }
+
+    pub(crate) fn encode_payload(&self) -> Vec<u8> {
         let mut b = Vec::new();
         b.extend_from_slice(&(self.sites.len() as u32).to_le_bytes());
         for (&site, state) in &self.sites {
@@ -240,6 +244,19 @@ impl Version {
     }
 
     pub fn decode_with_limits(buf: &[u8], limits: &ResourceLimits) -> Result<Self, EngineError> {
+        match crate::wire::Artifact::decode_with_limits(buf, limits)? {
+            crate::wire::Artifact::Version(version) => Ok(version),
+            _ => Err(EngineError::new(
+                ErrorCode::MalformedEncoding,
+                "expected an ESBT version artifact",
+            )),
+        }
+    }
+
+    pub(crate) fn decode_payload_with_limits(
+        buf: &[u8],
+        limits: &ResourceLimits,
+    ) -> Result<Self, EngineError> {
         if buf.len() > limits.max_message_bytes {
             return Err(EngineError::new(
                 ErrorCode::MessageTooLarge,
@@ -399,9 +416,9 @@ mod tests {
 
     #[test]
     fn decoder_rejects_trailing_or_noncanonical_data() {
-        let mut encoded = Version::default().encode();
+        let mut encoded = Version::default().encode_payload();
         encoded.push(0);
-        assert!(Version::decode(&encoded).is_none());
+        assert!(Version::decode_payload_with_limits(&encoded, &ResourceLimits::default()).is_err());
 
         // One site, prefix 0, and sparse sequence 1. Sequence 1 should have
         // been represented as the contiguous prefix instead.
@@ -411,6 +428,8 @@ mod tests {
         noncanonical.extend_from_slice(&0u64.to_le_bytes());
         noncanonical.extend_from_slice(&1u32.to_le_bytes());
         noncanonical.extend_from_slice(&1u64.to_le_bytes());
-        assert!(Version::decode(&noncanonical).is_none());
+        assert!(
+            Version::decode_payload_with_limits(&noncanonical, &ResourceLimits::default()).is_err()
+        );
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "esbt"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
 description = "ESBT sequence CRDT — Mechaoui & Imine, arXiv:2607.28101"
@@ -14,3 +14,6 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wit-bindgen = "=0.60.0"

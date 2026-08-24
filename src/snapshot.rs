@@ -14,23 +14,6 @@ use crate::update::{OperationRef, Update};
 use crate::weight::{SiteId, Weight};
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-const SNAPSHOT_MAGIC: &[u8; 4] = b"ESBS";
-const FULL_SNAPSHOT_MAGIC: &[u8; 4] = b"ESBF";
-const MESSAGE_MAGIC: &[u8; 4] = b"ESBM";
-
-/// Version of the Rust engine's persisted snapshot and mesh-message formats.
-///
-/// There is intentionally no legacy fallback: marks has no released data or
-/// clients, so an incompatible format should fail explicitly instead of being
-/// guessed from bytes. Version 2 introduced the Extension 2 compact
-/// identifier format (site dictionary, canonical varints, implicit defaults,
-/// front-coded sequence paths in snapshots); version 3 extends the same
-/// treatment to update payloads: a per-update site dictionary replaces the
-/// repeated 16-byte origins, operations are self-delimiting varint records,
-/// and sequence paths are front-coded across the canonically sorted
-/// operation list.
-pub const ENGINE_FORMAT_VERSION: u16 = 3;
-
 /// Smallest possible encoded atom: flags, p, q, site index, unit, counter.
 const MIN_ATOM_BYTES: usize = 7;
 /// Smallest possible encoded delete-log entry: flags, p, q, site, counter.
@@ -73,10 +56,12 @@ impl Snapshot {
     }
 
     pub fn encode(&self) -> Vec<u8> {
+        crate::wire::Artifact::CompactSnapshot(self.clone()).encode()
+    }
+
+    pub(crate) fn encode_payload(&self) -> Vec<u8> {
         let mut b = Vec::new();
-        b.extend_from_slice(SNAPSHOT_MAGIC);
-        b.extend_from_slice(&ENGINE_FORMAT_VERSION.to_le_bytes());
-        let insertions = self.insertions.encode();
+        let insertions = self.insertions.encode_payload();
         b.extend_from_slice(&(insertions.len() as u32).to_le_bytes());
         b.extend_from_slice(&insertions);
 
@@ -108,7 +93,7 @@ impl Snapshot {
             previous_path = &w.sc;
         }
 
-        let ve = self.version.encode();
+        let ve = self.version.encode_payload();
         b.extend_from_slice(&(ve.len() as u32).to_le_bytes());
         b.extend_from_slice(&ve);
         b
@@ -119,6 +104,19 @@ impl Snapshot {
     }
 
     pub fn decode_with_limits(buf: &[u8], limits: &ResourceLimits) -> Result<Self, EngineError> {
+        match crate::wire::Artifact::decode_with_limits(buf, limits)? {
+            crate::wire::Artifact::CompactSnapshot(snapshot) => Ok(snapshot),
+            _ => Err(EngineError::new(
+                ErrorCode::MalformedEncoding,
+                "expected an ESBT compact snapshot artifact",
+            )),
+        }
+    }
+
+    pub(crate) fn decode_payload_with_limits(
+        buf: &[u8],
+        limits: &ResourceLimits,
+    ) -> Result<Self, EngineError> {
         if buf.len() > limits.max_message_bytes {
             return Err(EngineError::new(
                 ErrorCode::MessageTooLarge,
@@ -126,17 +124,9 @@ impl Snapshot {
             ));
         }
         let mut reader = Reader::new(buf);
-        if reader.take(SNAPSHOT_MAGIC.len())? != SNAPSHOT_MAGIC {
-            return Err(EngineError::malformed("invalid snapshot magic"));
-        }
-        if reader.u16()? != ENGINE_FORMAT_VERSION {
-            return Err(EngineError::new(
-                ErrorCode::UnsupportedFormatVersion,
-                "unsupported snapshot format version",
-            ));
-        }
         let insertion_length = reader.u32()? as usize;
-        let insertions = Version::decode_with_limits(reader.take(insertion_length)?, limits)?;
+        let insertions =
+            Version::decode_payload_with_limits(reader.take(insertion_length)?, limits)?;
 
         let site_count = reader.uvarint()? as usize;
         if site_count > limits.max_version_sites || site_count > reader.remaining() / 16 {
@@ -259,7 +249,7 @@ impl Snapshot {
 
         let vl = reader.u32()? as usize;
         let vb = reader.take(vl)?;
-        let version = Version::decode_with_limits(vb, limits)?;
+        let version = Version::decode_payload_with_limits(vb, limits)?;
         if !reader.is_finished() {
             return Err(EngineError::new(
                 ErrorCode::NonCanonicalEncoding,
@@ -339,15 +329,16 @@ impl FullSnapshot {
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::new();
-        out.extend_from_slice(FULL_SNAPSHOT_MAGIC);
-        out.extend_from_slice(&ENGINE_FORMAT_VERSION.to_le_bytes());
+        crate::wire::Artifact::FullSnapshot(self.clone()).encode()
+    }
 
-        let state = self.state.encode();
+    pub(crate) fn encode_payload(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        let state = self.state.encode_payload();
         out.extend_from_slice(&(state.len() as u32).to_le_bytes());
         out.extend_from_slice(&state);
 
-        let floor = self.history_floor.encode();
+        let floor = self.history_floor.encode_payload();
         out.extend_from_slice(&(floor.len() as u32).to_le_bytes());
         out.extend_from_slice(&floor);
 
@@ -368,6 +359,19 @@ impl FullSnapshot {
     }
 
     pub fn decode_with_limits(bytes: &[u8], limits: &ResourceLimits) -> Result<Self, EngineError> {
+        match crate::wire::Artifact::decode_with_limits(bytes, limits)? {
+            crate::wire::Artifact::FullSnapshot(snapshot) => Ok(snapshot),
+            _ => Err(EngineError::new(
+                ErrorCode::MalformedEncoding,
+                "expected an ESBT full snapshot artifact",
+            )),
+        }
+    }
+
+    pub(crate) fn decode_payload_with_limits(
+        bytes: &[u8],
+        limits: &ResourceLimits,
+    ) -> Result<Self, EngineError> {
         if bytes.len() > limits.max_message_bytes {
             return Err(EngineError::new(
                 ErrorCode::MessageTooLarge,
@@ -375,20 +379,11 @@ impl FullSnapshot {
             ));
         }
         let mut reader = Reader::new(bytes);
-        if reader.take(FULL_SNAPSHOT_MAGIC.len())? != FULL_SNAPSHOT_MAGIC {
-            return Err(EngineError::malformed("invalid full snapshot magic"));
-        }
-        if reader.u16()? != ENGINE_FORMAT_VERSION {
-            return Err(EngineError::new(
-                ErrorCode::UnsupportedFormatVersion,
-                "unsupported full snapshot format version",
-            ));
-        }
-
         let state_length = reader.u32()? as usize;
-        let state = Snapshot::decode_with_limits(reader.take(state_length)?, limits)?;
+        let state = Snapshot::decode_payload_with_limits(reader.take(state_length)?, limits)?;
         let floor_length = reader.u32()? as usize;
-        let history_floor = Version::decode_with_limits(reader.take(floor_length)?, limits)?;
+        let history_floor =
+            Version::decode_payload_with_limits(reader.take(floor_length)?, limits)?;
         if !history_floor.is_contiguous() || !state.version.covers(&history_floor) {
             return Err(EngineError::new(
                 ErrorCode::NonCanonicalEncoding,
@@ -512,101 +507,11 @@ impl FullSnapshot {
     }
 }
 
-/// Envelope on the epidemic mesh.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Message {
-    Update(Update),
-    Snapshot(Snapshot),
-    FullSnapshot(FullSnapshot),
-}
-
-impl Message {
-    pub fn encode(&self) -> Vec<u8> {
-        let (tag, payload) = match self {
-            Message::Update(update) => (5, update.encode_payload()),
-            Message::Snapshot(s) => (3, s.encode()),
-            Message::FullSnapshot(snapshot) => (6, snapshot.encode()),
-        };
-
-        let mut encoded = Vec::with_capacity(11 + payload.len());
-        encoded.extend_from_slice(MESSAGE_MAGIC);
-        encoded.extend_from_slice(&ENGINE_FORMAT_VERSION.to_le_bytes());
-        encoded.push(tag);
-        encoded.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        encoded.extend_from_slice(&payload);
-        encoded
-    }
-
-    pub fn decode(buf: &[u8]) -> Option<Self> {
-        Self::decode_with_limits(buf, &ResourceLimits::wire_default()).ok()
-    }
-
-    pub fn decode_with_limits(buf: &[u8], limits: &ResourceLimits) -> Result<Self, EngineError> {
-        if buf.len() > limits.max_message_bytes {
-            return Err(EngineError::new(
-                ErrorCode::MessageTooLarge,
-                "message exceeds resource policy",
-            ));
-        }
-        let mut outer = Reader::new(buf);
-        if outer.take(MESSAGE_MAGIC.len())? != MESSAGE_MAGIC {
-            return Err(EngineError::malformed("invalid message magic"));
-        }
-        if outer.u16()? != ENGINE_FORMAT_VERSION {
-            return Err(EngineError::new(
-                ErrorCode::UnsupportedFormatVersion,
-                "unsupported message format version",
-            ));
-        }
-        let tag = outer.u8()?;
-        let payload_length = outer.u32()? as usize;
-        let payload = outer.take(payload_length)?;
-        if !outer.is_finished() {
-            return Err(EngineError::new(
-                ErrorCode::NonCanonicalEncoding,
-                "message length does not consume the envelope",
-            ));
-        }
-
-        let mut reader = Reader::new(payload);
-        let message = match tag {
-            3 => {
-                let snapshot = Snapshot::decode_with_limits(payload, limits)?;
-                reader.take(payload.len())?;
-                Message::Snapshot(snapshot)
-            }
-            5 => {
-                let update = Update::decode_payload(payload, limits)?;
-                reader.take(payload.len())?;
-                Message::Update(update)
-            }
-            6 => {
-                let snapshot = FullSnapshot::decode_with_limits(payload, limits)?;
-                reader.take(payload.len())?;
-                Message::FullSnapshot(snapshot)
-            }
-            _ => {
-                return Err(EngineError::new(
-                    ErrorCode::MalformedEncoding,
-                    "unknown message tag",
-                ))
-            }
-        };
-
-        if !reader.is_finished() {
-            return Err(EngineError::new(
-                ErrorCode::NonCanonicalEncoding,
-                "message payload contains trailing bytes",
-            ));
-        }
-        Ok(message)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::replica::{Replica, ReplicaConfig};
+    use crate::wire::Artifact;
 
     fn sample_snapshot() -> Snapshot {
         let mut replica = Replica::new(7, ReplicaConfig::default());
@@ -621,34 +526,34 @@ mod tests {
         assert_eq!(snapshot.encode(), snapshot.encode());
         assert_eq!(Snapshot::decode(&snapshot.encode()), Some(snapshot.clone()));
 
-        let messages = [Message::Snapshot(snapshot)];
-        for message in messages {
-            assert_eq!(Message::decode(&message.encode()), Some(message));
+        let artifacts = [Artifact::CompactSnapshot(snapshot)];
+        for artifact in artifacts {
+            assert_eq!(Artifact::decode(&artifact.encode()), Some(artifact));
         }
     }
 
     #[test]
     fn decoder_rejects_wrong_version_trailing_and_impossible_lengths() {
-        let message = Message::Snapshot(sample_snapshot()).encode();
+        let artifact = Artifact::CompactSnapshot(sample_snapshot()).encode();
 
-        let mut wrong_version = message.clone();
-        wrong_version[4..6].copy_from_slice(&(ENGINE_FORMAT_VERSION + 1).to_le_bytes());
-        assert!(Message::decode(&wrong_version).is_none());
+        let mut wrong_version = artifact.clone();
+        wrong_version[4..6].copy_from_slice(&(crate::wire::WIRE_FORMAT_VERSION + 1).to_le_bytes());
+        assert!(Artifact::decode(&wrong_version).is_none());
 
-        let mut trailing = message.clone();
+        let mut trailing = artifact.clone();
         trailing.push(0);
-        assert!(Message::decode(&trailing).is_none());
+        assert!(Artifact::decode(&trailing).is_none());
 
-        let mut impossible_length = message.clone();
+        let mut impossible_length = artifact.clone();
         impossible_length[7..11].copy_from_slice(&u32::MAX.to_le_bytes());
-        assert!(Message::decode(&impossible_length).is_none());
+        assert!(Artifact::decode(&impossible_length).is_none());
     }
 
     #[test]
     fn every_truncation_is_rejected_without_panicking() {
-        let message = Message::Snapshot(sample_snapshot()).encode();
-        for end in 0..message.len() {
-            let result = std::panic::catch_unwind(|| Message::decode(&message[..end]));
+        let artifact = Artifact::CompactSnapshot(sample_snapshot()).encode();
+        for end in 0..artifact.len() {
+            let result = std::panic::catch_unwind(|| Artifact::decode(&artifact[..end]));
             assert!(result.is_ok(), "decoder panicked at byte {end}");
             assert!(
                 result.unwrap().is_none(),
@@ -668,7 +573,7 @@ mod tests {
                 state ^= state << 5;
                 *byte = state as u8;
             }
-            let decoded = std::panic::catch_unwind(|| Message::decode(&bytes));
+            let decoded = std::panic::catch_unwind(|| Artifact::decode(&bytes));
             assert!(decoded.is_ok(), "decoder panicked on {length} random bytes");
         }
     }

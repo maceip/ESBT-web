@@ -1,23 +1,23 @@
-//! Extension 2 measurements: encoded identifier storage, format v1 vs v2.
+//! Extension 2 measurements against the retired fixed-width prototype.
 //!
-//! Format v1 had a closed-form size (fixed-width fields), so the comparison
-//! reconstructs v1 byte counts exactly from the same weights instead of
-//! keeping a legacy encoder alive.
+//! The prototype had a closed-form size, so the comparison reconstructs byte
+//! counts arithmetically from the same weights. No legacy encoder or decoder
+//! is present.
 
 use esbt::replica::{Replica, ReplicaConfig};
-use esbt::{Op, OpKind, Weight};
+use esbt::{Artifact, Op, OpKind, Update, Weight};
 
-/// v1 weight bytes: p:i64 + q:i64 + sn:i64 + site:u128 + len:u16 + 4·sc.
-fn v1_weight_bytes(weight: &Weight) -> usize {
+/// Prototype weight: p:i64 + q:i64 + sn:i64 + site:u128 + len:u16 + 4·sc.
+fn fixed_weight_bytes(weight: &Weight) -> usize {
     8 + 8 + 8 + 16 + 2 + 4 * weight.sc.len()
 }
 
-/// v1 operation bytes: tag + origin:u128 + seq:u64 + c:u64 + weight (+ unit).
-fn v1_op_bytes(op: &Op) -> usize {
+/// Prototype operation: tag + origin:u128 + seq:u64 + c:u64 + weight (+ unit).
+fn fixed_op_bytes(op: &Op) -> usize {
     1 + 16
         + 8
         + 8
-        + v1_weight_bytes(&op.weight)
+        + fixed_weight_bytes(&op.weight)
         + if matches!(op.kind, OpKind::Ins { .. }) {
             2
         } else {
@@ -25,18 +25,18 @@ fn v1_op_bytes(op: &Op) -> usize {
         }
 }
 
-/// v1 snapshot bytes: magic + version + length-prefixed insertion and
+/// Prototype snapshot: magic + version + length-prefixed insertion and
 /// version summaries + u32-counted atom and delete lists.
-fn v1_snapshot_bytes(snapshot: &esbt::Snapshot) -> usize {
+fn fixed_snapshot_bytes(snapshot: &esbt::Snapshot) -> usize {
     let mut total = 4 + 2;
     total += 4 + snapshot.insertions.encode().len();
     total += 4;
     for atom in &snapshot.atoms {
-        total += v1_weight_bytes(&atom.weight) + 2 + 8;
+        total += fixed_weight_bytes(&atom.weight) + 2 + 8;
     }
     total += 4;
     for (weight, _) in &snapshot.delete_log {
-        total += v1_weight_bytes(weight) + 8;
+        total += fixed_weight_bytes(weight) + 8;
     }
     total + 4 + snapshot.version.encode().len()
 }
@@ -45,14 +45,21 @@ fn cfg() -> ReplicaConfig {
     ReplicaConfig::default()
 }
 
+fn one_update_bytes(operation: &Op) -> Vec<u8> {
+    Artifact::Update(Update::new(vec![operation.clone()]).expect("one operation")).encode()
+}
+
 #[test]
 fn minimal_insertion_operation_shrinks() {
     let mut replica = Replica::new(3, cfg());
     let op = replica.local_insert(0, 'A' as u16);
-    let v1 = v1_op_bytes(&op);
-    let v2 = op.encode().len();
-    println!("minimal insertion op: v1 {v1} B, v2 {v2} B");
-    assert!(v2 * 2 < v1, "v1 {v1} vs v2 {v2}");
+    let fixed = fixed_op_bytes(&op);
+    let compact = one_update_bytes(&op).len();
+    println!("minimal insertion update: fixed {fixed} B, canonical {compact} B");
+    assert!(
+        compact * 5 < fixed * 3,
+        "fixed {fixed} vs compact {compact}"
+    );
 }
 
 #[test]
@@ -71,14 +78,14 @@ fn concurrent_typing_run_snapshot_shrinks() {
     assert_eq!(a.len(), 220);
 
     let snapshot = a.snapshot();
-    let v1 = v1_snapshot_bytes(&snapshot);
-    let v2 = snapshot.encode().len();
+    let fixed = fixed_snapshot_bytes(&snapshot);
+    let compact = snapshot.encode().len();
     println!(
-        "two-site typing-run snapshot ({} units): v1 {v1} B, v2 {v2} B ({:.1}%)",
+        "two-site typing-run snapshot ({} units): fixed {fixed} B, compact {compact} B ({:.1}%)",
         a.len(),
-        100.0 * v2 as f64 / v1 as f64
+        100.0 * compact as f64 / fixed as f64
     );
-    assert!(v2 * 3 < v1, "v1 {v1} vs v2 {v2}");
+    assert!(compact * 3 < fixed, "fixed {fixed} vs compact {compact}");
     assert_eq!(esbt::Snapshot::decode(&snapshot.encode()), Some(snapshot));
 }
 
@@ -105,36 +112,38 @@ fn mixed_editing_journal_shrinks() {
             ops.push(op);
         }
     }
-    let (v1, v2): (usize, usize) = ops
+    let (fixed, standalone): (usize, usize) = ops
         .iter()
-        .map(|op| (v1_op_bytes(op), op.encode().len()))
-        .fold((0, 0), |(v1, v2), (a, b)| (v1 + a, v2 + b));
+        .map(|op| (fixed_op_bytes(op), one_update_bytes(op).len()))
+        .fold((0, 0), |(fixed, standalone), (a, b)| {
+            (fixed + a, standalone + b)
+        });
     println!(
-        "mixed journal ({} ops, standalone): v1 {v1} B, v2 {v2} B ({:.1}%)",
+        "mixed journal ({} ops, standalone): fixed {fixed} B, compact {standalone} B ({:.1}%)",
         ops.len(),
-        100.0 * v2 as f64 / v1 as f64
+        100.0 * standalone as f64 / fixed as f64
     );
-    assert!(v2 * 2 < v1, "v1 {v1} vs v2 {v2}");
+    assert!(
+        standalone * 5 < fixed * 3,
+        "fixed {fixed} vs compact {standalone}"
+    );
     for op in &ops {
-        assert_eq!(Op::decode(&op.encode()).as_ref(), Some(op));
+        let decoded = Artifact::decode(&one_update_bytes(op)).expect("one-operation Update");
+        assert!(matches!(decoded, Artifact::Update(update) if update.operations() == [op.clone()]));
     }
 
-    // Format v3: the whole batch as one update message — the per-update site
-    // dictionary and cross-operation path front-coding on top of varints.
-    // The v1 payload was 4 count bytes plus a 4-byte length per operation,
-    // and 11 envelope bytes on both sides.
+    // The canonical whole-batch Update adds a per-update site dictionary and
+    // cross-operation path front-coding. The prototype payload had 4 count
+    // bytes plus a 4-byte length per operation and the same envelope width.
     let update = esbt::Update::new(ops.clone()).expect("canonical update");
-    let message = esbt::snapshot::Message::Update(update.clone()).encode();
-    let v1_message = 11 + 4 + v1 + 4 * ops.len();
+    let message = Artifact::Update(update.clone()).encode();
+    let fixed_message = 11 + 4 + fixed + 4 * ops.len();
     println!(
-        "mixed journal ({} ops, one v3 update message): v1 {v1_message} B, v3 {} B ({:.1}%)",
+        "mixed journal ({} ops, one Update artifact): fixed {fixed_message} B, canonical {} B ({:.1}%)",
         ops.len(),
         message.len(),
-        100.0 * message.len() as f64 / v1_message as f64
+        100.0 * message.len() as f64 / fixed_message as f64
     );
-    assert!(message.len() * 3 < v1_message);
-    assert_eq!(
-        esbt::snapshot::Message::decode(&message),
-        Some(esbt::snapshot::Message::Update(update))
-    );
+    assert!(message.len() * 3 < fixed_message);
+    assert_eq!(Artifact::decode(&message), Some(Artifact::Update(update)));
 }
