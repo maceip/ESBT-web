@@ -11,7 +11,7 @@
     "test:component": "npm run build:component && npm run check:component && npm run test:mesh && node demo/component-smoke.mjs && node demo/component-large-edit.mjs"
   },
   "dependencies": {
-    "agent-browser": "^0.8.0",
+    "agent-browser": "^0.34.0",
     "playwright": "^1.55.0",
     "puppeteer-core": "^25.8.0",
     "ws": "^8.18.0"
