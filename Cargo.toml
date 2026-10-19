@@ -16,4 +16,4 @@ panic = "abort"
 strip = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-wit-bindgen = "=0.62.0"
+wit-bindgen = "=0.63.0"
